@@ -1,12 +1,3 @@
-/*
- * fetch_data.js  —  nightly "Data Factory" for the Matchup-Weighted CUSH HR model.
- *
- * Dependency-free: uses Node 18+ global fetch + built-in modules only.
- * No npm install required. GitHub Actions runs `node fetch_data.js`, which
- * writes hr_matrix.json to the repo root for the app to fetch via
- * https://raw.githubusercontent.com/<you>/<repo>/main/hr_matrix.json
- */
-
 const fs = require('fs');
 
 const SEASON = Number(process.env.SEASON) || new Date().getFullYear();
@@ -182,4 +173,46 @@ async function getBullpens(){
       var s=d.stats&&d.stats[0]&&d.stats[0].splits&&d.stats[0].splits[0]&&d.stats[0].splits[0].stat;
       if(!s)continue;
       var hr=Number(s.homeRuns)||0, ip=parseIP(s.inningsPitched), bf=Number(s.battersFaced)||0;
-      if(ip>0) out[t.id]={team:t.abbreviation|
+      if(ip>0) out[t.id]={team:t.abbreviation||t.teamName||String(t.id),hr9:+((hr/ip)*9).toFixed(3),bf:bf,ip:+ip.toFixed(1)};
+    }catch(e){ console.error('bullpen', t.id, 'failed:', e.message); }
+    await new Promise(function(r){setTimeout(r,60);});
+  }
+  return out;
+}
+
+async function main() {
+  console.log('Data Factory start — season', SEASON);
+  const ids = await getStarters();
+  await enrichThrows(ids);
+  console.log('Probable starters found:', ids.size);
+
+  const pitchers = {};
+  const entries = [...ids.entries()];
+  for (let i = 0; i < entries.length; i += CONCURRENCY) {
+    const batch = entries.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async ([pid, meta]) => {
+      try {
+        const rec = await buildPitcher(pid, meta);
+        if (rec) { pitchers[pid] = rec; console.log('  ok   ', pid, meta.name); }
+        else console.log('  empty', pid, meta.name);
+      } catch (e) { console.error('  fail ', pid, meta.name, '-', e.message); }
+    }));
+    if (i + CONCURRENCY < entries.length) await new Promise((r) => setTimeout(r, BATCH_PAUSE_MS));
+  }
+
+  const count = Object.keys(pitchers).length;
+  if (count === 0) {
+    console.error('No pitchers built — leaving existing hr_matrix.json untouched.');
+    process.exit(0);
+  }
+
+  console.log('Fetching team bullpen stats...');
+  const bullpens = await getBullpens();
+  console.log('Bullpens built for', Object.keys(bullpens).length, 'teams.');
+
+  const out = { season: SEASON, generatedAt: new Date().toISOString(), pitchers, bullpens };
+  fs.writeFileSync('hr_matrix.json', JSON.stringify(out));
+  console.log('Wrote hr_matrix.json with', count, 'pitchers.');
+}
+
+main().catch((e) => { console.error('FATAL', e); process.exit(1); });
