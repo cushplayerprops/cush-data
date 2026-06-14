@@ -73,7 +73,7 @@ function detailsURL(pid) {
     `&game_date_gt=&game_date_lt=&hfMo=&hfTeam=&home_road=&hfRO=&position=` +
     `&hfInfield=&hfOutfield=&hfInn=&hfBBT=&hfFlag=&metric_1=&group_by=name` +
     `&min_pitches=0&min_results=0&min_pas=0&sort_col=pitches` +
-    `&player_event_sort=api_p_release_speed&sort_order=desc&type=details&player_id=${pid}`;
+    `&player_event_sort=api_p_release_speed&sort_order=desc&type=details&pitchers_lookup%5B%5D=${pid}`;
 }
 
 async function getStarters() {
@@ -137,6 +137,7 @@ async function buildPitcher(pid, meta) {
   }
 
   if (totalPitches === 0) return null;
+  if (totalPitches > 6000) throw new Error('too many pitches (' + totalPitches + ') — player filter likely failed');
 
   const arsenal = {};
   for (const pt in pitchCount) arsenal[pt] = +(pitchCount[pt] / totalPitches).toFixed(3);
