@@ -2,7 +2,7 @@ name: HR Matrix Data Factory
 
 on:
   schedule:
-    - cron: '0 8 * * *'
+    - cron: '0 8,14,18 * * *'
   workflow_dispatch: {}
 
 permissions:
