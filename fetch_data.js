@@ -157,4 +157,118 @@ async function buildPitcher(pid, meta) {
   const disc = { L: newDisc(), R: newDisc(), ALL: newDisc() }; // plate discipline vs LHB/RHB/all
 
   for (const r of rows) {
-    const pt = (r.pitch_type ||
+    const pt = (r.pitch_type || '').trim();
+    if (!pt || pt === 'null') continue;
+    pitchCount[pt] = (pitchCount[pt] || 0) + 1;
+    totalPitches++;
+
+    const standRaw = (r.stand || '').trim().toUpperCase();
+    const hand = standRaw === 'L' ? 'L' : standRaw === 'R' ? 'R' : null;
+
+    // plate discipline — every pitch counts (not just batted balls)
+    const desc = (r.description || '').trim();
+    const zoneNum = parseInt(r.zone, 10);
+    const inZone = zoneNum >= 1 && zoneNum <= 9;     // Statcast zones 1-9 = strike zone
+    const outZone = zoneNum >= 11 && zoneNum <= 14;  // zones 11-14 = out of zone (chase territory)
+    const isSwing = SWING_DESC[desc] === 1;
+    const isWhiff = WHIFF_DESC[desc] === 1;
+    tallyDisc(disc.ALL, inZone, outZone, isSwing, isWhiff);
+    if (hand) tallyDisc(disc[hand], inZone, outZone, isSwing, isWhiff);
+
+    // barrels-allowed matrix (batted balls only)
+    if (!isBattedBall(r)) continue;
+    const barrel = isBarrel(r) ? 1 : 0;
+    if (!cells[pt]) cells[pt] = {};
+    if (hand) {
+      if (!cells[pt][hand]) cells[pt][hand] = { bbe: 0, barrels: 0 };
+      cells[pt][hand].bbe++; cells[pt][hand].barrels += barrel;
+    }
+    if (!cells[pt].ALL) cells[pt].ALL = { bbe: 0, barrels: 0 };
+    cells[pt].ALL.bbe++; cells[pt].ALL.barrels += barrel;
+  }
+
+  if (totalPitches === 0) return null;
+  if (totalPitches > 6000) throw new Error('too many pitches (' + totalPitches + ') — player filter likely failed');
+
+  const arsenal = {};
+  for (const pt in pitchCount) arsenal[pt] = +(pitchCount[pt] / totalPitches).toFixed(3);
+
+  const allowed = {};
+  for (const pt in cells) {
+    allowed[pt] = {};
+    for (const hand of ['L', 'R', 'ALL']) {
+      const c = cells[pt][hand];
+      if (c && c.bbe > 0) allowed[pt][hand] = { brlPct: +((c.barrels / c.bbe) * 100).toFixed(1), n: c.bbe };
+    }
+  }
+
+  return { name: meta.name, throws: meta.throws || null, arsenal, allowed, disc: { L: discPct(disc.L), R: discPct(disc.R), ALL: discPct(disc.ALL) } };
+}
+
+// MLB innings-pitched string ("412.1" == 412 + 1/3) -> decimal
+function parseIP(ipStr){
+  if(ipStr==null)return 0;
+  var s=String(ipStr), dot=s.indexOf('.');
+  if(dot<0)return Number(s)||0;
+  var whole=Number(s.slice(0,dot))||0, frac=s.slice(dot+1);
+  return whole + (frac==='1'?1/3:frac==='2'?2/3:0);
+}
+
+// Team bullpen (relief-only) HR/9 + batters faced, season, via statsapi role split.
+async function getBullpens(){
+  var out={};
+  var teams;
+  try{ teams=(await getJSON(`${MLB}/teams?sportId=1&season=${SEASON}`)).teams||[]; }
+  catch(e){ console.error('teams list failed:', e.message); return out; }
+  for(const t of teams){
+    try{
+      var url=`${MLB}/teams/${t.id}/stats?stats=statSplits&group=pitching&season=${SEASON}&gameType=R&sitCodes=rp`;
+      var d=await getJSON(url);
+      var s=d.stats&&d.stats[0]&&d.stats[0].splits&&d.stats[0].splits[0]&&d.stats[0].splits[0].stat;
+      if(!s)continue;
+      var hr=Number(s.homeRuns)||0, ip=parseIP(s.inningsPitched), bf=Number(s.battersFaced)||0;
+      if(ip>0) out[t.id]={team:t.abbreviation||t.teamName||String(t.id),hr9:+((hr/ip)*9).toFixed(3),bf:bf,ip:+ip.toFixed(1)};
+    }catch(e){ console.error('bullpen', t.id, 'failed:', e.message); }
+    await new Promise(function(r){setTimeout(r,60);});
+  }
+  return out;
+}
+
+// ---------- main ----------
+async function main() {
+  console.log('Data Factory start — season', SEASON);
+  const ids = await getStarters();
+  await enrichThrows(ids);
+  console.log('Probable starters found:', ids.size);
+
+  const pitchers = {};
+  const entries = [...ids.entries()];
+  for (let i = 0; i < entries.length; i += CONCURRENCY) {
+    const batch = entries.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(async ([pid, meta]) => {
+      try {
+        const rec = await buildPitcher(pid, meta);
+        if (rec) { pitchers[pid] = rec; console.log('  ok   ', pid, meta.name); }
+        else console.log('  empty', pid, meta.name);
+      } catch (e) { console.error('  fail ', pid, meta.name, '-', e.message); }
+    }));
+    if (i + CONCURRENCY < entries.length) await new Promise((r) => setTimeout(r, BATCH_PAUSE_MS));
+  }
+
+  const count = Object.keys(pitchers).length;
+  if (count === 0) {
+    // Do NOT overwrite the last good file with an empty one (off-day / total failure).
+    console.error('No pitchers built — leaving existing hr_matrix.json untouched.');
+    process.exit(0);
+  }
+
+  console.log('Fetching team bullpen stats...');
+  const bullpens = await getBullpens();
+  console.log('Bullpens built for', Object.keys(bullpens).length, 'teams.');
+
+  const out = { season: SEASON, generatedAt: new Date().toISOString(), pitchers, bullpens };
+  fs.writeFileSync('hr_matrix.json', JSON.stringify(out));
+  console.log('Wrote hr_matrix.json with', count, 'pitchers.');
+}
+
+main().catch((e) => { console.error('FATAL', e); process.exit(1); });
