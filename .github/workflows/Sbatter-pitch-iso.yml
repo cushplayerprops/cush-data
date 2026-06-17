@@ -1,0 +1,36 @@
+name: Build batter_pitch_iso
+
+# Generates batter_pitch_iso.json a few times a day and commits it to the repo.
+# The site (cushplayerprops.win) loads that file to skip the in-browser Savant crawl.
+
+on:
+  workflow_dispatch:            # <-- lets you run it manually from the Actions tab (do this first to test)
+  schedule:
+    - cron: "0 11,16,21 * * *"  # ~6am / 11am / 4pm ET. Adjust to match your hr_matrix schedule.
+
+permissions:
+  contents: write               # needed so the action can commit the json back
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pybaseball pandas
+
+      - name: Build batter_pitch_iso.json
+        run: python build_batter_pitch_iso.py
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add batter_pitch_iso.json
+          git diff --staged --quiet || git commit -m "update batter_pitch_iso.json"
+          git push
