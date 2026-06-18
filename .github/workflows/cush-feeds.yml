@@ -23,6 +23,7 @@ jobs:
           python build_hitter_ewma.py || echo "hitter_ewma failed"
           python build_pitcher_ewma.py || echo "pitcher_ewma failed"
           python build_hand_splits.py || echo "hand_splits failed"
+          python build_projections.py || echo "projections failed"
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
