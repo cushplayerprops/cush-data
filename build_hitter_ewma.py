@@ -21,7 +21,7 @@ is missing or has effPa<=0. Absent feed => model behaves exactly as before.
 DESIGN NOTES (the choices that matter for accuracy):
   * Metric = xwOBA, not wOBA. xwOBA strips batted-ball luck, is more predictive of
     future production, and stabilizes faster -> a better recency signal.
-  * HALF_LIFE_PA = 130 (~last 30 games). Deliberately conservative. A short, streaky
+  * HALF_LIFE_PA = 250 (~last 60 games). Backtest-tuned: long+regressed wins. A short, streaky
     half-life feels clever but backtests WORSE -- it chases noise. Long + regressed
     captures genuine change (swing/health/role) while staying anchored to true talent.
   * Weighting is per-PA, not per-game, so a 5-PA day counts more than a 2-PA day.
@@ -40,7 +40,7 @@ your BPI build, the cheapest path is to compute the EWMA from THAT cached event 
 import csv, io, json, sys, time, urllib.request, urllib.error
 
 SEASON         = 2026
-HALF_LIFE_PA   = 130          # EWMA half-life in plate appearances
+HALF_LIFE_PA   = 250          # EWMA half-life in plate appearances
 MLB_BASE       = "https://statsapi.mlb.com/api/v1"
 SAVANT_CSV     = "https://baseballsavant.mlb.com/statcast_search/csv"
 OUT_PATH       = "hitter_ewma.json"
