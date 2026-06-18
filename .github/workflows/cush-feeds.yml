@@ -22,6 +22,7 @@ jobs:
           python build_team_k_recent.py || echo "team_k failed"
           python build_hitter_ewma.py || echo "hitter_ewma failed"
           python build_pitcher_ewma.py || echo "pitcher_ewma failed"
+          python build_hand_splits.py || echo "hand_splits failed"
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
