@@ -23,7 +23,8 @@ METHOD (Marcel, the standard baseline every real system is measured against):
     veterans barely shrink.
   * Convert OPS to the app's wRC+ scale with the SAME formula the hand-splits feed
     uses, so it's apples-to-apples.
-  (Aging adjustment intentionally omitted in v1 -- smallest Marcel term, easy to add.)
+  * Apply the Marcel aging curve from each hitter's current age (gentle: ~+0.6%/yr
+    of youth below age 29, ~-0.3%/yr of decline above, capped at +/-8%).
 
 DEPENDENCIES: standard library only. No API key.
 DEPLOY: run -> push projections.json to root of cushplayerprops/cush-data main -> cron.
@@ -37,6 +38,10 @@ YEAR_W     = {2026: 5.0, 2025: 4.0, 2024: 3.0}
 LG_OPS     = 0.720
 LG_ISO     = 0.150
 REG        = 1500.0                       # regression strength, in weighted-PA units
+AGE_PEAK   = 29                           # Marcel aging: peak age
+AGE_UP     = 0.006                        # per-year gain below peak
+AGE_DN     = 0.003                        # per-year decline above peak
+AGE_CLAMP  = 0.08                         # cap the aging swing at +/-8%
 OPS_DIV    = 0.720
 MLB_BASE   = "https://statsapi.mlb.com/api/v1"
 OUT_PATH   = "projections.json"
@@ -69,6 +74,31 @@ def hitter_ids():
                 ids[p["person"]["id"]] = p["person"].get("fullName", "")
         time.sleep(0.04)
     return ids
+
+
+def ages_for(ids):
+    """Batched currentAge lookup: {id -> age}. One call per ~50 ids."""
+    out = {}
+    keys = list(ids)
+    for i in range(0, len(keys), 50):
+        chunk = keys[i:i + 50]
+        data = _get("%s/people?personIds=%s" % (MLB_BASE, ",".join(str(k) for k in chunk)))
+        try:
+            for p in json.loads(data or '{"people":[]}').get("people", []):
+                a = p.get("currentAge")
+                if a is not None:
+                    out[p["id"]] = float(a)
+        except (TypeError, ValueError):
+            pass
+        time.sleep(0.05)
+    return out
+
+
+def age_factor(age):
+    if age is None:
+        return 1.0
+    adj = (AGE_PEAK - age) * (AGE_UP if age < AGE_PEAK else AGE_DN)
+    return max(1.0 - AGE_CLAMP, min(1.0 + AGE_CLAMP, 1.0 + adj))
 
 
 def _f(v, default=0.0):
@@ -129,6 +159,8 @@ def main():
     print("collecting hitters ...", file=sys.stderr)
     ids = hitter_ids()
     print("  %d hitters" % len(ids), file=sys.stderr)
+    ages = ages_for(ids)
+    print("  %d ages" % len(ages), file=sys.stderr)
     out = {}
     items = sorted(ids.items())
     for i, (pid, name) in enumerate(items, 1):
@@ -137,6 +169,10 @@ def main():
         proj_ops, wpa, proj_iso = project(lines)
         if proj_ops is None:
             continue
+        af = age_factor(ages.get(pid))
+        proj_ops *= af
+        if proj_iso is not None:
+            proj_iso *= af
         rec = {"wrc": int(round(proj_ops / OPS_DIV * 100)), "pa": int(round(wpa))}
         if proj_iso is not None:
             rec["iso"] = round(proj_iso, 3)
