@@ -38,6 +38,9 @@ LG_IP      = 5.3
 IP_REG     = 3.0
 LG_ERA     = 4.20
 ERA_REG    = 30.0
+MIN_OPP_G  = 5                              # need >=5 prior opp games before trusting their R/G
+OPP_LO     = 0.80                           # oppRunFac caps (mild, per the design doc)
+OPP_HI     = 1.20
 MLB_BASE   = "https://statsapi.mlb.com/api/v1"
 TIMEOUT    = 30
 UA = {"User-Agent": "Mozilla/5.0 (cush-fs-backtest)"}
@@ -80,8 +83,10 @@ def poi_cdf3(l):
     return e * (1 + l + l * l / 2 + l * l * l / 6)
 
 
-def project(prior):
-    """Model FP from prior-only accumulators dict {ip,so,bf,er,gs}. Backbone only."""
+def project(prior, opp_run_fac=1.0):
+    """Model FP from prior-only accumulators dict {ip,so,bf,er,gs}. Backbone only.
+    opp_run_fac scales the run-prevention rate (opponent offense). 1.0 = neutral
+    = original behavior, so the baseline arm is unchanged."""
     gs = prior["gs"]
     avg_ip = prior["ip"] / gs if gs else LG_IP
     xIP = clmp((avg_ip * gs + LG_IP * IP_REG) / (gs + IP_REG), 3.0, 7.5)
@@ -90,10 +95,11 @@ def project(prior):
     xK = clmp(k_rate * xIP * bf_per_ip, 0, 15)
     era = (prior["er"] / prior["ip"] * 9) if prior["ip"] > 0 else LG_ERA
     xERA9 = (era * prior["ip"] + LG_ERA * ERA_REG) / (prior["ip"] + ERA_REG)
-    xER = clmp(xERA9 * xIP / 9, 0, 9)
+    xERA9adj = xERA9 * opp_run_fac                 # opponent-offense adjusted run rate
+    xER = clmp(xERA9adj * xIP / 9, 0, 9)
     pIP6 = clmp(0.5 + (xIP - 6) * 0.35, 0.02, 0.95)
-    pQS = pIP6 * poi_cdf3(xERA9 * 6 / 9)
-    pWIN = clmp(0.5 + ((LG_ERA - xERA9) / 1.20) * 0.08, 0.30, 0.70)
+    pQS = pIP6 * poi_cdf3(xERA9adj * 6 / 9)        # tougher offense -> fewer quality starts
+    pWIN = clmp(0.5 + ((LG_ERA - xERA9) / 1.20) * 0.08, 0.30, 0.70)  # pitcher quality, unadjusted
     fp = 3 * xIP + 3 * xK - 3 * xER + 6 * pWIN + 4 * pQS
     return {"fp": fp, "xIP": xIP, "xK": xK, "xER": xER}
 
@@ -104,11 +110,15 @@ def actual_fp(ipf, so, er, win):
     return outs + 3 * so - 3 * er + 4 * qs + 6 * (1 if win else 0), outs, qs
 
 
-def pitcher_ids():
+def all_team_ids():
+    data = _get(MLB_BASE + "/teams?sportId=1") or '{"teams":[]}'
+    return [t["id"] for t in json.loads(data).get("teams", [])]
+
+
+def pitcher_ids(team_ids):
     ids = {}
-    teams = json.loads(_get(MLB_BASE + "/teams?sportId=1") or '{"teams":[]}')["teams"]
-    for t in teams:
-        data = _get("%s/teams/%d/roster?rosterType=active" % (MLB_BASE, t["id"]))
+    for tid in team_ids:
+        data = _get("%s/teams/%d/roster?rosterType=active" % (MLB_BASE, tid))
         if not data:
             continue
         for p in json.loads(data).get("roster", []):
@@ -116,6 +126,43 @@ def pitcher_ids():
                 ids[p["person"]["id"]] = 1
         time.sleep(0.04)
     return list(ids)
+
+
+def team_runs(team_ids):
+    """{teamId: sorted [(date, runsScored)]} from team hitting game logs,
+    plus league runs/game (used to center oppRunFac at 1.0)."""
+    tr = {}
+    allruns = []
+    for tid in team_ids:
+        data = _get("%s/teams/%d/stats?stats=gameLog&group=hitting&season=%d&gameType=R"
+                    % (MLB_BASE, tid, SEASON))
+        lst = []
+        if data:
+            try:
+                for sp in json.loads(data)["stats"][0]["splits"]:
+                    st = sp.get("stat") or {}
+                    try:
+                        rn = int(st.get("runs") or 0)
+                    except (TypeError, ValueError):
+                        rn = 0
+                    lst.append((sp.get("date") or "", rn))
+                    allruns.append(rn)
+            except (KeyError, IndexError, TypeError):
+                pass
+        lst.sort(key=lambda x: x[0])
+        tr[tid] = lst
+        time.sleep(0.04)
+    lg = (sum(allruns) / len(allruns)) if allruns else 4.40
+    return tr, lg
+
+
+def opp_prior_rg(tr, opp_id, date):
+    """Opponent runs/game using ONLY their games before `date` (leakage-free)."""
+    games = tr.get(opp_id) or []
+    vals = [r for (d, r) in games if d < date]
+    if len(vals) < MIN_OPP_G:
+        return None
+    return sum(vals) / len(vals)
 
 
 def starts(pid):
@@ -140,7 +187,8 @@ def starts(pid):
                 except (TypeError, ValueError):
                     return 0
             rows.append({"date": sp.get("date") or "", "ip": ipf, "so": _i("strikeOuts"),
-                         "bf": _i("battersFaced"), "er": _i("earnedRuns"), "win": _i("wins") >= 1})
+                         "bf": _i("battersFaced"), "er": _i("earnedRuns"), "win": _i("wins") >= 1,
+                         "opp": (sp.get("opponent") or {}).get("id")})
     except (KeyError, IndexError, TypeError):
         return []
     rows.sort(key=lambda r: r["date"])
@@ -162,14 +210,21 @@ def pearson(xs, ys):
 
 
 def main():
+    print("collecting teams + opponent offense ...", file=sys.stderr)
+    tids = all_team_ids()
+    tr, LG_RG = team_runs(tids)
+    print("  %d teams, league R/G = %.2f" % (len(tids), LG_RG), file=sys.stderr)
     print("collecting pitchers ...", file=sys.stderr)
-    ids = pitcher_ids()
+    ids = pitcher_ids(tids)
     print("  %d pitchers" % len(ids), file=sys.stderr)
 
-    P_fp, A_fp = [], []
+    P_fp, A_fp = [], []                      # baseline (oppRunFac = 1.0)
     P_ip, A_ip = [], []
     P_k,  A_k  = [], []
     P_er, A_er = [], []
+    P_fp2 = []                               # +opponent-offense arm
+    P_er2 = []
+    opp_used = 0
 
     for i, pid in enumerate(sorted(ids), 1):
         gs_rows = starts(pid)
@@ -179,12 +234,20 @@ def main():
         acc = {"ip": 0.0, "so": 0, "bf": 0, "er": 0, "gs": 0}
         for r in gs_rows:
             if acc["gs"] >= MIN_PRIOR and acc["ip"] > 0:
-                pr = project(acc)
+                # opponent-offense factor (leakage-free: opp games before this date)
+                orf = 1.0
+                prg = opp_prior_rg(tr, r.get("opp"), r["date"]) if r.get("opp") is not None else None
+                if prg is not None:
+                    orf = clmp(prg / LG_RG, OPP_LO, OPP_HI)
+                    opp_used += 1
+                pr  = project(acc, 1.0)                 # baseline arm
+                pr2 = project(acc, orf)                 # +opponent-offense arm
                 af, outs, qs = actual_fp(r["ip"], r["so"], r["er"], r["win"])
-                P_fp.append(pr["fp"]); A_fp.append(af)
+                P_fp.append(pr["fp"]);  A_fp.append(af)
                 P_ip.append(pr["xIP"]); A_ip.append(r["ip"])
                 P_k.append(pr["xK"]);   A_k.append(r["so"])
                 P_er.append(pr["xER"]); A_er.append(r["er"])
+                P_fp2.append(pr2["fp"]); P_er2.append(pr2["xER"])
             acc["ip"] += r["ip"]; acc["so"] += r["so"]; acc["bf"] += r["bf"]
             acc["er"] += r["er"]; acc["gs"] += 1
         if i % 50 == 0:
@@ -195,7 +258,7 @@ def main():
         print("not enough test starts (%d) -- run later in the season." % n)
         return
 
-    # top-decile lift
+    # top-decile lift (baseline)
     order = sorted(range(n), key=lambda j: P_fp[j], reverse=True)
     top = order[:max(1, n // 10)]
     lift = (sum(A_fp[j] for j in top) / len(top)) / (sum(A_fp) / n)
@@ -210,8 +273,23 @@ def main():
     print("r(xIP, actual IP)    : %.3f" % pearson(P_ip, A_ip))
     print("r(xK,  actual K)     : %.3f" % pearson(P_k,  A_k))
     print("r(xER, actual ER)    : %.3f" % pearson(P_er, A_er))
-    print("\nNote: opponent K/offense layers omitted (backbone test). P(Win) is a crude")
-    print("proxy by design -- weak r on the win component is expected and low-stakes.")
+
+    # ---- xER LEVER: opponent offense (baseline vs +opp off, one run) ----
+    order2 = sorted(range(n), key=lambda j: P_fp2[j], reverse=True)
+    top2 = order2[:max(1, n // 10)]
+    lift2 = (sum(A_fp[j] for j in top2) / len(top2)) / (sum(A_fp) / n)
+    print("\n=== xER LEVER: opponent offense wired into runs (oppRunFac) ===")
+    print("league R/G %.2f | cap [%.2f,%.2f] | min opp games %d | opp data used %d/%d starts"
+          % (LG_RG, OPP_LO, OPP_HI, MIN_OPP_G, opp_used, n))
+    print("                        BASELINE     +OPP OFF")
+    print("r(xER, actual ER)     :   %.3f        %.3f" % (pearson(P_er, A_er), pearson(P_er2, A_er)))
+    print("r(proj FP, actual FP) :   %.3f        %.3f" % (pearson(P_fp, A_fp), pearson(P_fp2, A_fp)))
+    print("top-decile LIFT       :   %.2fx        %.2fx" % (lift, lift2))
+    print("mean PROJ FP          :   %.2f        %.2f" % (sum(P_fp) / n, sum(P_fp2) / n))
+    print("bias (proj-actual)    :   %+.2f        %+.2f"
+          % ((sum(P_fp) - sum(A_fp)) / n, (sum(P_fp2) - sum(A_fp)) / n))
+    print("\nNote: BASELINE column should match the prior run (sanity). P(Win) stays a")
+    print("crude proxy by design; opponent offense is applied to xER and P(QS) only.")
 
 
 if __name__ == "__main__":
