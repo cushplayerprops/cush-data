@@ -24,6 +24,7 @@ jobs:
           python build_pitcher_ewma.py || echo "pitcher_ewma failed"
           python build_hand_splits.py || echo "hand_splits failed"
           python build_projections.py || echo "projections failed"
+          python build_pitcher_proj.py || echo "pitcher_proj failed"
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
