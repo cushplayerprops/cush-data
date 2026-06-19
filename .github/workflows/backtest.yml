@@ -12,4 +12,4 @@ jobs:
         with:
           python-version: '3.11'
       - name: Run backtest
-        run: python backtest_recency.py
+        run: python backtest_projection.py
