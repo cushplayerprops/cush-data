@@ -1,15 +1,33 @@
-name: Recency backtest
+name: Pitcher FS Backtest
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   backtest:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: Run backtest
-        run: python backtest_hr_weight.py
+          python-version: "3.11"
+
+      - name: Run pitcher FS backtest
+        run: |
+          set -o pipefail
+          python backtest_pitcher_fs.py | tee fs_backtest_report.txt
+
+      - name: Upload report (clean copy to download)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fs_backtest_report
+          path: fs_backtest_report.txt
+          if-no-files-found: ignore
