@@ -1,0 +1,47 @@
+name: Hitter Park Backtest
+
+# Run it yourself from the Actions tab (no schedule, no auto-trigger).
+on:
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: "Season(s), comma-separated (e.g. 2024 or 2023,2024)"
+        default: "2024"
+      max_hitters:
+        description: "Max hitters to include (most PA first)"
+        default: "150"
+
+permissions:
+  contents: read
+
+jobs:
+  hitter-park:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Pure standard library -> no pip install needed.
+      - name: Self-test (offline math check)
+        run: python backtest_hitter_park.py --selftest
+
+      - name: Run hitter park backtest
+        run: >
+          python backtest_hitter_park.py
+          --seasons "${{ github.event.inputs.seasons }}"
+          --max-hitters "${{ github.event.inputs.max_hitters }}"
+          --verbose
+          --csv-out hitter_park_results.csv
+
+      - name: Upload results CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hitter_park_results
+          path: hitter_park_results.csv
+          if-no-files-found: ignore
