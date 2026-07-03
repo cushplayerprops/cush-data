@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
 build_wnba.py - fetch WNBA schedule + player 3PA/FGA/MIN + team pace from stats.wnba.com,
-write wnba_stats.json for cushplayerprops.win. Runs from GitHub Actions (Azure),
-which stats.wnba.com answers, unlike Netlify/AWS.
+write wnba_stats.json for cushplayerprops.win. Runs from GitHub Actions.
+stats.wnba.com blocks data-center IPs, so all requests are routed through the
+ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY env var / repo secret).
 Requires: pip install requests
 """
 
 import os, json, time, datetime
 import requests
+from urllib.parse import urlencode
 
 SEASON = os.environ.get("WNBA_SEASON", "2026")
 LEAGUE = "10"                       # 10 = WNBA
 OUT    = os.environ.get("OUT", "wnba_stats.json")
 BASE   = "https://stats.wnba.com/stats"
+
+SCRAPEOPS_KEY = os.environ.get("SCRAPEOPS_API_KEY", "")
+PROXY = "https://proxy.scrapeops.io/v1/"
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -28,11 +33,21 @@ HEADERS = {
 
 
 def get(path, params, tries=4):
-    url = BASE + path
+    # Build the real stats.wnba.com URL (with its query string), then hand the
+    # whole thing to ScrapeOps so it fetches it from a residential IP for us.
+    target = BASE + path + "?" + urlencode(params)
+    proxy_payload = {
+        "api_key": SCRAPEOPS_KEY,
+        "url": target,
+        "residential": "true",   # datacenter IPs are what stats.wnba.com blocks
+        "keep_headers": "true",  # forward the NBA-stats headers defined above
+    }
+    proxy_url = PROXY + "?" + urlencode(proxy_payload)
     last = None
     for i in range(tries):
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=25)
+            # ScrapeOps retries on its side for up to ~2 min, so give it 130s.
+            r = requests.get(proxy_url, headers=HEADERS, timeout=130)
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -90,6 +105,9 @@ def num(v):
 
 
 def main():
+    if not SCRAPEOPS_KEY:
+        print("WARNING: SCRAPEOPS_API_KEY not set -- requests will likely fail (403).")
+
     errors = {}
     game_date = os.environ.get("WNBA_DATE", et_date())
 
