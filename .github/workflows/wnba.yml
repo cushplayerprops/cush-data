@@ -22,6 +22,8 @@ jobs:
         run: pip install requests
 
       - name: Build wnba_stats.json
+        env:
+          SCRAPEOPS_API_KEY: ${{ secrets.SCRAPEOPS_API_KEY }}
         run: python build_wnba.py
 
       - name: Commit if changed
