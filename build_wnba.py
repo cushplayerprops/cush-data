@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-build_wnba.py - fetch WNBA schedule + player 3PA/FGA/MIN + shot zones + team pace
-+ opponent defense from stats.wnba.com, write wnba_stats.json for cushplayerprops.win.
-Runs from GitHub Actions. stats.wnba.com blocks data-center IPs, so all requests
-are routed through the ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY secret).
-Requires: pip install requests
+build_wnba.py - fetch WNBA schedule + player 3PA/FGA/MIN + shot zones + catch&shoot/
+pull-up splits + team pace + opponent defense from stats.wnba.com, write
+wnba_stats.json for cushplayerprops.win. Runs from GitHub Actions. stats.wnba.com
+blocks data-center IPs, so all requests route through the ScrapeOps residential
+proxy (needs SCRAPEOPS_API_KEY secret). Requires: pip install requests
 """
 
 import os, json, time, datetime
@@ -75,9 +75,8 @@ def rows(js, name=None):
 
 def shot_zone_rows(js):
     # leaguedashplayershotlocations returns a special two-tier header:
-    # one header lists the zone names, the other is the flat column list
-    # (PLAYER_ID, PLAYER_NAME, TEAM_ID, TEAM_ABBREVIATION, AGE, then FGM/FGA/FG_PCT
-    # repeated per zone). resultSets here is a single object, not a list.
+    # one header lists zone names, the other is the flat column list
+    # (PLAYER_ID, ..., then FGM/FGA/FG_PCT repeated per zone).
     rs = (js or {}).get("resultSets") or {}
     if isinstance(rs, list):
         rs = rs[0] if rs else {}
@@ -122,6 +121,21 @@ def dash(extra):
     }
     p.update(extra)
     return p
+
+
+def ptshot_params(general_range):
+    # leaguedashplayerptshot has a different parameter set than the dash endpoints
+    return {
+        "CloseDefDistRange": "", "College": "", "Conference": "", "Country": "",
+        "DateFrom": "", "DateTo": "", "Division": "", "DraftPick": "", "DraftYear": "",
+        "DribbleRange": "", "GameSegment": "", "GeneralRange": general_range,
+        "Height": "", "LastNGames": "0", "LeagueID": LEAGUE, "Location": "",
+        "Month": "0", "OpponentTeamID": "0", "Outcome": "", "PORound": "0",
+        "PerMode": "PerGame", "Period": "0", "PlayerExperience": "", "PlayerPosition": "",
+        "Season": SEASON, "SeasonSegment": "", "SeasonType": "Regular Season",
+        "ShotClockRange": "", "ShotDistRange": "", "StarterBench": "", "TeamID": "0",
+        "TouchTimeRange": "", "VsConference": "", "VsDivision": "", "Weight": "",
+    }
 
 
 def et_date():
@@ -208,6 +222,26 @@ def main():
         ingest_zones(get("/leaguedashplayershotlocations", dash({"DistanceRange": "By Zone"})))
     except Exception as e:
         errors["shotZones"] = str(e)
+
+    # Catch & Shoot vs Pull-Up: how each player generates their attempts
+    def ingest_ptshot(js, prefix):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            p = players[pid]
+            p[prefix + "fga"]  = num(r.get("FGA"))
+            p[prefix + "fg3a"] = num(r.get("FG3A"))
+            p[prefix + "freq"] = num(r.get("FGA_FREQUENCY"))
+
+    try:
+        ingest_ptshot(get("/leaguedashplayerptshot", ptshot_params("Catch and Shoot")), "cs_")
+    except Exception as e:
+        errors["catchShoot"] = str(e)
+    try:
+        ingest_ptshot(get("/leaguedashplayerptshot", ptshot_params("Pull Ups")), "pu_")
+    except Exception as e:
+        errors["pullUp"] = str(e)
 
     # players carry TEAM_ABBREVIATION; use them to fill team abbreviations
     id2abbr = {}
