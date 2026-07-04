@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-build_wnba.py - fetch WNBA schedule + player 3PA/FGA/MIN + shot zones + catch&shoot/
-pull-up splits + team pace + opponent defense from stats.wnba.com, write
-wnba_stats.json for cushplayerprops.win. Runs from GitHub Actions. stats.wnba.com
-blocks data-center IPs, so all requests route through the ScrapeOps residential
-proxy (needs SCRAPEOPS_API_KEY secret). Requires: pip install requests
+build_wnba.py - fetch WNBA schedule + player 3PA/FGA/MIN + shot zones + assisted
+rate (catch&shoot vs self-created proxy) + team pace + opponent defense from
+stats.wnba.com, write wnba_stats.json for cushplayerprops.win. Runs from GitHub
+Actions. stats.wnba.com blocks data-center IPs, so all requests route through the
+ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY secret). Requires: pip install requests
 """
 
 import os, json, time, datetime
@@ -123,21 +123,6 @@ def dash(extra):
     return p
 
 
-def ptshot_params(general_range):
-    # leaguedashplayerptshot has a different parameter set than the dash endpoints
-    return {
-        "CloseDefDistRange": "", "College": "", "Conference": "", "Country": "",
-        "DateFrom": "", "DateTo": "", "Division": "", "DraftPick": "", "DraftYear": "",
-        "DribbleRange": "", "GameSegment": "", "GeneralRange": general_range,
-        "Height": "", "LastNGames": "0", "LeagueID": LEAGUE, "Location": "",
-        "Month": "0", "OpponentTeamID": "0", "Outcome": "", "PORound": "0",
-        "PerMode": "PerGame", "Period": "0", "PlayerExperience": "", "PlayerPosition": "",
-        "Season": SEASON, "SeasonSegment": "", "SeasonType": "Regular Season",
-        "ShotClockRange": "", "ShotDistRange": "", "StarterBench": "", "TeamID": "0",
-        "TouchTimeRange": "", "VsConference": "", "VsDivision": "", "Weight": "",
-    }
-
-
 def et_date():
     import zoneinfo
     now = datetime.datetime.now(zoneinfo.ZoneInfo("America/New_York"))
@@ -223,25 +208,21 @@ def main():
     except Exception as e:
         errors["shotZones"] = str(e)
 
-    # Catch & Shoot vs Pull-Up: how each player generates their attempts
-    def ingest_ptshot(js, prefix):
+    # Assisted rate: real WNBA measured stat. High ast% on 3s = fed / catch-and-shoot
+    # type (offense-dependent volume); low = self-creator / pull-up type (stable volume).
+    def ingest_scoring(js):
         for r in rows(js):
             pid = r.get("PLAYER_ID")
             if pid is None or pid not in players:
                 continue
             p = players[pid]
-            p[prefix + "fga"]  = num(r.get("FGA"))
-            p[prefix + "fg3a"] = num(r.get("FG3A"))
-            p[prefix + "freq"] = num(r.get("FGA_FREQUENCY"))
+            p["ast3Pct"]  = num(r.get("PCT_AST_3PM"))   # % of made 3s assisted
+            p["astFgPct"] = num(r.get("PCT_AST_FGM"))   # % of all made FGs assisted
 
     try:
-        ingest_ptshot(get("/leaguedashplayerptshot", ptshot_params("Catch and Shoot")), "cs_")
+        ingest_scoring(get("/leaguedashplayerstats", dash({"MeasureType": "Scoring"})))
     except Exception as e:
-        errors["catchShoot"] = str(e)
-    try:
-        ingest_ptshot(get("/leaguedashplayerptshot", ptshot_params("Pull Ups")), "pu_")
-    except Exception as e:
-        errors["pullUp"] = str(e)
+        errors["scoring"] = str(e)
 
     # players carry TEAM_ABBREVIATION; use them to fill team abbreviations
     id2abbr = {}
