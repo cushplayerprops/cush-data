@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-build_wnba.py - fetch WNBA schedule + player 3PA/FGA/MIN + team pace from stats.wnba.com,
-write wnba_stats.json for cushplayerprops.win. Runs from GitHub Actions.
-stats.wnba.com blocks data-center IPs, so all requests are routed through the
-ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY env var / repo secret).
+build_wnba.py - fetch WNBA schedule + player 3PA/FGA/MIN + team pace + opponent
+defense from stats.wnba.com, write wnba_stats.json for cushplayerprops.win.
+Runs from GitHub Actions. stats.wnba.com blocks data-center IPs, so all requests
+are routed through the ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY secret).
 Requires: pip install requests
 """
 
@@ -163,6 +163,19 @@ def main():
             }
     except Exception as e:
         errors["teamPace"] = str(e)
+
+    # Opponent defense: how many FGA / 3PA each team ALLOWS per game (matchup lever)
+    try:
+        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent"}))):
+            tid = r.get("TEAM_ID")
+            t = teams.get(tid)
+            if t is None:
+                t = teams.setdefault(tid, {"id": tid, "abbr": r.get("TEAM_ABBREVIATION")})
+            t["oppFga"]    = num(r.get("OPP_FGA"))
+            t["oppFg3a"]   = num(r.get("OPP_FG3A"))
+            t["oppFg3Pct"] = num(r.get("OPP_FG3_PCT"))
+    except Exception as e:
+        errors["teamOpp"] = str(e)
 
     out = {
         "updated": datetime.datetime.utcnow().isoformat() + "Z",
