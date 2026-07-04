@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-build_wnba.py - fetch WNBA schedule + player 3PA/FGA/MIN + team pace + opponent
-defense from stats.wnba.com, write wnba_stats.json for cushplayerprops.win.
+build_wnba.py - fetch WNBA schedule + player 3PA/FGA/MIN + shot zones + team pace
++ opponent defense from stats.wnba.com, write wnba_stats.json for cushplayerprops.win.
 Runs from GitHub Actions. stats.wnba.com blocks data-center IPs, so all requests
 are routed through the ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY secret).
 Requires: pip install requests
@@ -71,6 +71,41 @@ def rows(js, name=None):
         return []
     H = st["headers"]
     return [dict(zip(H, row)) for row in st.get("rowSet", [])]
+
+
+def shot_zone_rows(js):
+    # leaguedashplayershotlocations returns a special two-tier header:
+    # one header lists the zone names, the other is the flat column list
+    # (PLAYER_ID, PLAYER_NAME, TEAM_ID, TEAM_ABBREVIATION, AGE, then FGM/FGA/FG_PCT
+    # repeated per zone). resultSets here is a single object, not a list.
+    rs = (js or {}).get("resultSets") or {}
+    if isinstance(rs, list):
+        rs = rs[0] if rs else {}
+    hdrs = rs.get("headers") or []
+    zone_names, flat, skip = [], [], 5
+    for h in hdrs:
+        cn = h.get("columnNames") or []
+        if "PLAYER_ID" in cn:
+            flat = cn
+        else:
+            zone_names = cn
+        if h.get("columnsToSkip") is not None:
+            skip = h.get("columnsToSkip")
+    if not flat:
+        return []
+    out = []
+    for row in rs.get("rowSet", []):
+        d = {}
+        for i in range(min(skip, len(flat), len(row))):
+            d[flat[i]] = row[i]
+        idx = skip
+        for z in zone_names:
+            for stat in ("FGM", "FGA", "FG_PCT"):
+                if idx < len(row):
+                    d[f"{z}|{stat}"] = row[idx]
+                idx += 1
+        out.append(d)
+    return out
 
 
 def dash(extra):
@@ -154,11 +189,38 @@ def main():
     except Exception as e:
         errors["playersRecent"] = str(e)
 
+    # Shot zones: split each player's FGA into rim / paint / mid / corner3 / above-break3
+    def ingest_zones(js):
+        for r in shot_zone_rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            p = players[pid]
+            g = lambda z: num(r.get(z + "|FGA"))
+            lc, rc = g("Left Corner 3"), g("Right Corner 3")
+            p["z_ra"]      = g("Restricted Area")
+            p["z_paint"]   = g("In The Paint (Non-RA)")
+            p["z_mid"]     = g("Mid-Range")
+            p["z_corner3"] = round((lc or 0) + (rc or 0), 3)
+            p["z_above3"]  = g("Above the Break 3")
+
+    try:
+        ingest_zones(get("/leaguedashplayershotlocations", dash({"DistanceRange": "By Zone"})))
+    except Exception as e:
+        errors["shotZones"] = str(e)
+
+    # players carry TEAM_ABBREVIATION; use them to fill team abbreviations
+    id2abbr = {}
+    for p in players.values():
+        if p.get("teamId") is not None and p.get("teamAbbr"):
+            id2abbr[p["teamId"]] = p["teamAbbr"]
+
     teams = {}
     try:
         for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Advanced"}))):
-            teams[r.get("TEAM_ID")] = {
-                "id": r.get("TEAM_ID"), "abbr": r.get("TEAM_ABBREVIATION"),
+            tid = r.get("TEAM_ID")
+            teams[tid] = {
+                "id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION"),
                 "pace": num(r.get("PACE")), "gp": num(r.get("GP")),
             }
     except Exception as e:
@@ -170,7 +232,7 @@ def main():
             tid = r.get("TEAM_ID")
             t = teams.get(tid)
             if t is None:
-                t = teams.setdefault(tid, {"id": tid, "abbr": r.get("TEAM_ABBREVIATION")})
+                t = teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
             t["oppFga"]    = num(r.get("OPP_FGA"))
             t["oppFg3a"]   = num(r.get("OPP_FG3A"))
             t["oppFg3Pct"] = num(r.get("OPP_FG3_PCT"))
