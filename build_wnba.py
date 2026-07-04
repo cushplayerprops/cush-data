@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-build_wnba.py - WNBA feed for cushplayerprops.win. Pulls schedule + player
-3PA/FGA/PTS/MIN + shot zones + assisted rate + team pace + opponent defense
-(totals AND by-zone) from stats.wnba.com. Runs from GitHub Actions. stats.wnba.com
-blocks data-center IPs, so all requests route through the ScrapeOps residential
-proxy (needs SCRAPEOPS_API_KEY secret). Requires: pip install requests
+build_wnba.py - WNBA feed for cushplayerprops.win. Schedule + player
+3PA/FGA/PTS/MIN + shot zones + assisted rate + per-game logs + team pace +
+opponent defense (totals AND by-zone) from stats.wnba.com. Runs from GitHub
+Actions via the ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY secret).
+Requires: pip install requests
 """
 
 import os, json, time, datetime
@@ -12,7 +12,7 @@ import requests
 from urllib.parse import urlencode
 
 SEASON = os.environ.get("WNBA_SEASON", "2026")
-LEAGUE = "10"                       # 10 = WNBA
+LEAGUE = "10"
 OUT    = os.environ.get("OUT", "wnba_stats.json")
 BASE   = "https://stats.wnba.com/stats"
 
@@ -34,12 +34,7 @@ HEADERS = {
 
 def get(path, params, tries=4):
     target = BASE + path + "?" + urlencode(params)
-    proxy_payload = {
-        "api_key": SCRAPEOPS_KEY,
-        "url": target,
-        "residential": "true",
-        "keep_headers": "true",
-    }
+    proxy_payload = {"api_key": SCRAPEOPS_KEY, "url": target, "residential": "true", "keep_headers": "true"}
     proxy_url = PROXY + "?" + urlencode(proxy_payload)
     last = None
     for i in range(tries):
@@ -60,8 +55,7 @@ def rows(js, name=None):
     if name:
         for x in rs:
             if x.get("name") == name:
-                st = x
-                break
+                st = x; break
     else:
         st = rs[0] if rs else None
     if not st:
@@ -71,9 +65,6 @@ def rows(js, name=None):
 
 
 def shot_zone_rows(js):
-    # Handles BOTH player and team shot-location responses. They use a two-tier
-    # header: one lists zone names, the other is the flat column list. Player
-    # version leads with PLAYER_ID (+5 skip); team version leads with TEAM_ID (+2 skip).
     rs = (js or {}).get("resultSets") or {}
     if isinstance(rs, list):
         rs = rs[0] if rs else {}
@@ -120,6 +111,16 @@ def dash(extra):
     return p
 
 
+def logs_params():
+    return {
+        "DateFrom": "", "DateTo": "", "GameSegment": "", "ISTRound": "", "LastNGames": "0",
+        "LeagueID": LEAGUE, "Location": "", "MeasureType": "Base", "Month": "0",
+        "OppTeamID": "0", "Outcome": "", "PORound": "0", "PerMode": "Totals", "Period": "0",
+        "PlayerID": "", "Season": SEASON, "SeasonSegment": "", "SeasonType": "Regular Season",
+        "ShotClockRange": "", "TeamID": "0", "VsConference": "", "VsDivision": "",
+    }
+
+
 def et_date():
     import zoneinfo
     now = datetime.datetime.now(zoneinfo.ZoneInfo("America/New_York"))
@@ -150,8 +151,7 @@ def main():
                 team_abbr[r["TEAM_ID"]] = r.get("TEAM_ABBREVIATION")
         for g in rows(sb, "GameHeader"):
             games.append({
-                "gameId": g.get("GAME_ID"),
-                "status": g.get("GAME_STATUS_ID"),
+                "gameId": g.get("GAME_ID"), "status": g.get("GAME_STATUS_ID"),
                 "statusText": (g.get("GAME_STATUS_TEXT") or "").strip(),
                 "home": {"id": g.get("HOME_TEAM_ID"), "abbr": team_abbr.get(g.get("HOME_TEAM_ID"))},
                 "away": {"id": g.get("VISITOR_TEAM_ID"), "abbr": team_abbr.get(g.get("VISITOR_TEAM_ID"))},
@@ -166,10 +166,8 @@ def main():
             pid = r.get("PLAYER_ID")
             if pid is None:
                 continue
-            p = players.setdefault(pid, {
-                "id": pid, "name": r.get("PLAYER_NAME"),
-                "teamId": r.get("TEAM_ID"), "teamAbbr": r.get("TEAM_ABBREVIATION"),
-            })
+            p = players.setdefault(pid, {"id": pid, "name": r.get("PLAYER_NAME"),
+                "teamId": r.get("TEAM_ID"), "teamAbbr": r.get("TEAM_ABBREVIATION")})
             p[prefix + "gp"] = num(r.get("GP"))
             p[prefix + "min"] = num(r.get("MIN"))
             p[prefix + "fga"] = num(r.get("FGA"))
@@ -193,11 +191,11 @@ def main():
             p = players[pid]
             g = lambda z: num(r.get(z + "|FGA"))
             lc, rc = g("Left Corner 3"), g("Right Corner 3")
-            p["z_ra"]      = g("Restricted Area")
-            p["z_paint"]   = g("In The Paint (Non-RA)")
-            p["z_mid"]     = g("Mid-Range")
+            p["z_ra"] = g("Restricted Area")
+            p["z_paint"] = g("In The Paint (Non-RA)")
+            p["z_mid"] = g("Mid-Range")
             p["z_corner3"] = round((lc or 0) + (rc or 0), 3)
-            p["z_above3"]  = g("Above the Break 3")
+            p["z_above3"] = g("Above the Break 3")
 
     try:
         ingest_zones(get("/leaguedashplayershotlocations", dash({"DistanceRange": "By Zone"})))
@@ -210,13 +208,42 @@ def main():
             if pid is None or pid not in players:
                 continue
             p = players[pid]
-            p["ast3Pct"]  = num(r.get("PCT_AST_3PM"))
+            p["ast3Pct"] = num(r.get("PCT_AST_3PM"))
             p["astFgPct"] = num(r.get("PCT_AST_FGM"))
 
     try:
         ingest_scoring(get("/leaguedashplayerstats", dash({"MeasureType": "Scoring"})))
     except Exception as e:
         errors["scoring"] = str(e)
+
+    # Per-game logs (recent games) -> powers L10 hit-rate + out/usage flags.
+    # PerMode=Totals gives each game's actual raw stat line.
+    def ingest_logs(js):
+        tmp = {}
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None:
+                continue
+            tmp.setdefault(pid, []).append({
+                "d": r.get("GAME_DATE"),
+                "min": num(r.get("MIN")),
+                "fga": num(r.get("FGA")),
+                "fg3a": num(r.get("FG3A")),
+                "fg3m": num(r.get("FG3M")),
+                "pts": num(r.get("PTS")),
+            })
+        for pid, gl in tmp.items():
+            gl.sort(key=lambda g: (g.get("d") or ""), reverse=True)
+            recent = gl[:12]
+            if pid in players:
+                players[pid]["log"] = recent
+            else:
+                players[pid] = {"id": pid, "log": recent}
+
+    try:
+        ingest_logs(get("/playergamelogs", logs_params()))
+    except Exception as e:
+        errors["gameLogs"] = str(e)
 
     id2abbr = {}
     for p in players.values():
@@ -227,57 +254,45 @@ def main():
     try:
         for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Advanced"}))):
             tid = r.get("TEAM_ID")
-            teams[tid] = {
-                "id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION"),
-                "pace": num(r.get("PACE")), "gp": num(r.get("GP")),
-            }
+            teams[tid] = {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION"),
+                "pace": num(r.get("PACE")), "gp": num(r.get("GP"))}
     except Exception as e:
         errors["teamPace"] = str(e)
 
     try:
         for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent"}))):
             tid = r.get("TEAM_ID")
-            t = teams.get(tid)
-            if t is None:
-                t = teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
-            t["oppFga"]    = num(r.get("OPP_FGA"))
-            t["oppFg3a"]   = num(r.get("OPP_FG3A"))
+            t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
+            t["oppFga"] = num(r.get("OPP_FGA"))
+            t["oppFg3a"] = num(r.get("OPP_FG3A"))
             t["oppFg3Pct"] = num(r.get("OPP_FG3_PCT"))
     except Exception as e:
         errors["teamOpp"] = str(e)
 
-    # Defense BY ZONE: how many FGA each team ALLOWS in each zone (marriage-score input).
-    # This is the defensive mirror of the player shot-zone profile.
     def ingest_team_zones(js):
         for r in shot_zone_rows(js):
             tid = r.get("TEAM_ID")
             if tid is None:
                 continue
-            t = teams.get(tid)
-            if t is None:
-                t = teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid)})
+            t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid)})
             gg = lambda z: num(r.get(z + "|FGA"))
             lc, rc = gg("Left Corner 3"), gg("Right Corner 3")
-            t["dz_ra"]      = gg("Restricted Area")
-            t["dz_paint"]   = gg("In The Paint (Non-RA)")
-            t["dz_mid"]     = gg("Mid-Range")
+            t["dz_ra"] = gg("Restricted Area")
+            t["dz_paint"] = gg("In The Paint (Non-RA)")
+            t["dz_mid"] = gg("Mid-Range")
             t["dz_corner3"] = round((lc or 0) + (rc or 0), 3)
-            t["dz_above3"]  = gg("Above the Break 3")
+            t["dz_above3"] = gg("Above the Break 3")
 
     try:
-        ingest_team_zones(get("/leaguedashteamshotlocations",
-                              dash({"MeasureType": "Opponent", "DistanceRange": "By Zone"})))
+        ingest_team_zones(get("/leaguedashteamshotlocations", dash({"MeasureType": "Opponent", "DistanceRange": "By Zone"})))
     except Exception as e:
         errors["teamZoneDef"] = str(e)
 
     out = {
         "updated": datetime.datetime.utcnow().isoformat() + "Z",
-        "season": SEASON,
-        "gameDate": game_date,
+        "season": SEASON, "gameDate": game_date,
         "counts": {"games": len(games), "players": len(players), "teams": len(teams)},
-        "games": games,
-        "teams": teams,
-        "players": players,
+        "games": games, "teams": teams, "players": players,
     }
     if errors:
         out["errors"] = errors
