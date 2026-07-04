@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-build_wnba.py - fetch WNBA schedule + player 3PA/FGA/MIN + shot zones + assisted
-rate (catch&shoot vs self-created proxy) + team pace + opponent defense from
-stats.wnba.com, write wnba_stats.json for cushplayerprops.win. Runs from GitHub
-Actions. stats.wnba.com blocks data-center IPs, so all requests route through the
-ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY secret). Requires: pip install requests
+build_wnba.py - WNBA feed for cushplayerprops.win. Pulls schedule + player
+3PA/FGA/PTS/MIN + shot zones + assisted rate + team pace + opponent defense
+(totals AND by-zone) from stats.wnba.com. Runs from GitHub Actions. stats.wnba.com
+blocks data-center IPs, so all requests route through the ScrapeOps residential
+proxy (needs SCRAPEOPS_API_KEY secret). Requires: pip install requests
 """
 
 import os, json, time, datetime
@@ -33,20 +33,17 @@ HEADERS = {
 
 
 def get(path, params, tries=4):
-    # Build the real stats.wnba.com URL (with its query string), then hand the
-    # whole thing to ScrapeOps so it fetches it from a residential IP for us.
     target = BASE + path + "?" + urlencode(params)
     proxy_payload = {
         "api_key": SCRAPEOPS_KEY,
         "url": target,
-        "residential": "true",   # datacenter IPs are what stats.wnba.com blocks
-        "keep_headers": "true",  # forward the NBA-stats headers defined above
+        "residential": "true",
+        "keep_headers": "true",
     }
     proxy_url = PROXY + "?" + urlencode(proxy_payload)
     last = None
     for i in range(tries):
         try:
-            # ScrapeOps retries on its side for up to ~2 min, so give it 130s.
             r = requests.get(proxy_url, headers=HEADERS, timeout=130)
             r.raise_for_status()
             return r.json()
@@ -74,9 +71,9 @@ def rows(js, name=None):
 
 
 def shot_zone_rows(js):
-    # leaguedashplayershotlocations returns a special two-tier header:
-    # one header lists zone names, the other is the flat column list
-    # (PLAYER_ID, ..., then FGM/FGA/FG_PCT repeated per zone).
+    # Handles BOTH player and team shot-location responses. They use a two-tier
+    # header: one lists zone names, the other is the flat column list. Player
+    # version leads with PLAYER_ID (+5 skip); team version leads with TEAM_ID (+2 skip).
     rs = (js or {}).get("resultSets") or {}
     if isinstance(rs, list):
         rs = rs[0] if rs else {}
@@ -84,7 +81,7 @@ def shot_zone_rows(js):
     zone_names, flat, skip = [], [], 5
     for h in hdrs:
         cn = h.get("columnNames") or []
-        if "PLAYER_ID" in cn:
+        if "PLAYER_ID" in cn or "TEAM_ID" in cn:
             flat = cn
         else:
             zone_names = cn
@@ -188,7 +185,6 @@ def main():
     except Exception as e:
         errors["playersRecent"] = str(e)
 
-    # Shot zones: split each player's FGA into rim / paint / mid / corner3 / above-break3
     def ingest_zones(js):
         for r in shot_zone_rows(js):
             pid = r.get("PLAYER_ID")
@@ -208,23 +204,20 @@ def main():
     except Exception as e:
         errors["shotZones"] = str(e)
 
-    # Assisted rate: real WNBA measured stat. High ast% on 3s = fed / catch-and-shoot
-    # type (offense-dependent volume); low = self-creator / pull-up type (stable volume).
     def ingest_scoring(js):
         for r in rows(js):
             pid = r.get("PLAYER_ID")
             if pid is None or pid not in players:
                 continue
             p = players[pid]
-            p["ast3Pct"]  = num(r.get("PCT_AST_3PM"))   # % of made 3s assisted
-            p["astFgPct"] = num(r.get("PCT_AST_FGM"))   # % of all made FGs assisted
+            p["ast3Pct"]  = num(r.get("PCT_AST_3PM"))
+            p["astFgPct"] = num(r.get("PCT_AST_FGM"))
 
     try:
         ingest_scoring(get("/leaguedashplayerstats", dash({"MeasureType": "Scoring"})))
     except Exception as e:
         errors["scoring"] = str(e)
 
-    # players carry TEAM_ABBREVIATION; use them to fill team abbreviations
     id2abbr = {}
     for p in players.values():
         if p.get("teamId") is not None and p.get("teamAbbr"):
@@ -241,7 +234,6 @@ def main():
     except Exception as e:
         errors["teamPace"] = str(e)
 
-    # Opponent defense: how many FGA / 3PA each team ALLOWS per game (matchup lever)
     try:
         for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent"}))):
             tid = r.get("TEAM_ID")
@@ -253,6 +245,30 @@ def main():
             t["oppFg3Pct"] = num(r.get("OPP_FG3_PCT"))
     except Exception as e:
         errors["teamOpp"] = str(e)
+
+    # Defense BY ZONE: how many FGA each team ALLOWS in each zone (marriage-score input).
+    # This is the defensive mirror of the player shot-zone profile.
+    def ingest_team_zones(js):
+        for r in shot_zone_rows(js):
+            tid = r.get("TEAM_ID")
+            if tid is None:
+                continue
+            t = teams.get(tid)
+            if t is None:
+                t = teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid)})
+            gg = lambda z: num(r.get(z + "|FGA"))
+            lc, rc = gg("Left Corner 3"), gg("Right Corner 3")
+            t["dz_ra"]      = gg("Restricted Area")
+            t["dz_paint"]   = gg("In The Paint (Non-RA)")
+            t["dz_mid"]     = gg("Mid-Range")
+            t["dz_corner3"] = round((lc or 0) + (rc or 0), 3)
+            t["dz_above3"]  = gg("Above the Break 3")
+
+    try:
+        ingest_team_zones(get("/leaguedashteamshotlocations",
+                              dash({"MeasureType": "Opponent", "DistanceRange": "By Zone"})))
+    except Exception as e:
+        errors["teamZoneDef"] = str(e)
 
     out = {
         "updated": datetime.datetime.utcnow().isoformat() + "Z",
