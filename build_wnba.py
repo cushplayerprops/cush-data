@@ -2,7 +2,7 @@
 """
 build_wnba.py - WNBA feed for cushplayerprops.win. Schedule + player
 3PA/FGA/PTS/MIN + shot zones + assisted rate + per-game logs + team pace +
-opponent defense (totals AND by-zone) from stats.wnba.com. Runs from GitHub
+opponent defense (totals, FT-allowed, AND by-zone) + player free throws from stats.wnba.com. Runs from GitHub
 Actions via the ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY secret).
 Requires: pip install requests
 """
@@ -173,6 +173,9 @@ def main():
             p[prefix + "fga"] = num(r.get("FGA"))
             p[prefix + "fg3a"] = num(r.get("FG3A"))
             p[prefix + "pts"] = num(r.get("PTS"))
+            p[prefix + "ftm"] = num(r.get("FTM"))
+            p[prefix + "fta"] = num(r.get("FTA"))
+            p[prefix + "ftPct"] = num(r.get("FT_PCT"))
 
     try:
         ingest(get("/leaguedashplayerstats", dash({"LastNGames": "0"})), "")
@@ -231,6 +234,8 @@ def main():
                 "fg3a": num(r.get("FG3A")),
                 "fg3m": num(r.get("FG3M")),
                 "pts": num(r.get("PTS")),
+                "ftm": num(r.get("FTM")),
+                "fta": num(r.get("FTA")),
             })
         for pid, gl in tmp.items():
             gl.sort(key=lambda g: (g.get("d") or ""), reverse=True)
@@ -261,49 +266,3 @@ def main():
 
     try:
         for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent"}))):
-            tid = r.get("TEAM_ID")
-            t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
-            t["oppFga"] = num(r.get("OPP_FGA"))
-            t["oppFg3a"] = num(r.get("OPP_FG3A"))
-            t["oppFg3Pct"] = num(r.get("OPP_FG3_PCT"))
-    except Exception as e:
-        errors["teamOpp"] = str(e)
-
-    def ingest_team_zones(js):
-        for r in shot_zone_rows(js):
-            tid = r.get("TEAM_ID")
-            if tid is None:
-                continue
-            t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid)})
-            gg = lambda z: num(r.get(z + "|FGA"))
-            lc, rc = gg("Left Corner 3"), gg("Right Corner 3")
-            t["dz_ra"] = gg("Restricted Area")
-            t["dz_paint"] = gg("In The Paint (Non-RA)")
-            t["dz_mid"] = gg("Mid-Range")
-            t["dz_corner3"] = round((lc or 0) + (rc or 0), 3)
-            t["dz_above3"] = gg("Above the Break 3")
-
-    try:
-        ingest_team_zones(get("/leaguedashteamshotlocations", dash({"MeasureType": "Opponent", "DistanceRange": "By Zone"})))
-    except Exception as e:
-        errors["teamZoneDef"] = str(e)
-
-    out = {
-        "updated": datetime.datetime.utcnow().isoformat() + "Z",
-        "season": SEASON, "gameDate": game_date,
-        "counts": {"games": len(games), "players": len(players), "teams": len(teams)},
-        "games": games, "teams": teams, "players": players,
-    }
-    if errors:
-        out["errors"] = errors
-
-    with open(OUT, "w") as f:
-        json.dump(out, f, separators=(",", ":"))
-
-    print("WROTE", OUT, out["counts"], ("ERRORS: " + json.dumps(errors)) if errors else "")
-    if not players and not games:
-        raise SystemExit("no data fetched -- stats.wnba.com likely blocked this runner")
-
-
-if __name__ == "__main__":
-    main()
