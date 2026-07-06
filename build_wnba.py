@@ -219,8 +219,6 @@ def main():
     except Exception as e:
         errors["scoring"] = str(e)
 
-    # Per-game logs (recent games) -> powers L10 hit-rate + out/usage flags.
-    # PerMode=Totals gives each game's actual raw stat line.
     def ingest_logs(js):
         tmp = {}
         for r in rows(js):
@@ -266,3 +264,50 @@ def main():
 
     try:
         for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent"}))):
+            tid = r.get("TEAM_ID")
+            t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
+            t["oppFga"] = num(r.get("OPP_FGA"))
+            t["oppFg3a"] = num(r.get("OPP_FG3A"))
+            t["oppFg3Pct"] = num(r.get("OPP_FG3_PCT"))
+            t["oppFta"] = num(r.get("OPP_FTA"))
+    except Exception as e:
+        errors["teamOpp"] = str(e)
+
+    def ingest_team_zones(js):
+        for r in shot_zone_rows(js):
+            tid = r.get("TEAM_ID")
+            if tid is None:
+                continue
+            t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid)})
+            gg = lambda z: num(r.get(z + "|FGA"))
+            lc, rc = gg("Left Corner 3"), gg("Right Corner 3")
+            t["dz_ra"] = gg("Restricted Area")
+            t["dz_paint"] = gg("In The Paint (Non-RA)")
+            t["dz_mid"] = gg("Mid-Range")
+            t["dz_corner3"] = round((lc or 0) + (rc or 0), 3)
+            t["dz_above3"] = gg("Above the Break 3")
+
+    try:
+        ingest_team_zones(get("/leaguedashteamshotlocations", dash({"MeasureType": "Opponent", "DistanceRange": "By Zone"})))
+    except Exception as e:
+        errors["teamZoneDef"] = str(e)
+
+    out = {
+        "updated": datetime.datetime.utcnow().isoformat() + "Z",
+        "season": SEASON, "gameDate": game_date,
+        "counts": {"games": len(games), "players": len(players), "teams": len(teams)},
+        "games": games, "teams": teams, "players": players,
+    }
+    if errors:
+        out["errors"] = errors
+
+    with open(OUT, "w") as f:
+        json.dump(out, f, separators=(",", ":"))
+
+    print("WROTE", OUT, out["counts"], ("ERRORS: " + json.dumps(errors)) if errors else "")
+    if not players and not games:
+        raise SystemExit("no data fetched -- stats.wnba.com likely blocked this runner")
+
+
+if __name__ == "__main__":
+    main()
