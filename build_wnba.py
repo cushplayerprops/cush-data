@@ -7,7 +7,7 @@ Actions via the ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY secret).
 Requires: pip install requests
 """
 
-import os, json, time, datetime
+import os, json, time, datetime, re, unicodedata
 import requests
 from urllib.parse import urlencode
 
@@ -18,6 +18,7 @@ BASE   = "https://stats.wnba.com/stats"
 
 SCRAPEOPS_KEY = os.environ.get("SCRAPEOPS_API_KEY", "")
 PROXY = "https://proxy.scrapeops.io/v1/"
+ESPN_INJ = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/injuries"
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -127,6 +128,77 @@ def et_date():
     return now.strftime("%m/%d/%Y")
 
 
+def pbnorm(s):
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.lower()
+    s = s.replace("'", "").replace("\u2019", "")
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def get_url(full_url, tries=4, residential=True):
+    payload = {"api_key": SCRAPEOPS_KEY, "url": full_url}
+    if residential:
+        payload["residential"] = "true"
+    proxy_url = PROXY + "?" + urlencode(payload)
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(proxy_url, timeout=130)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            print(f"  retry {i+1}/{tries} for proxied url: {e}")
+            time.sleep(3 + i * 3)
+    raise last
+
+
+def fetch_injuries_raw():
+    # ESPN site.api is public; try direct first (free), fall back to the ScrapeOps proxy.
+    try:
+        r = requests.get(ESPN_INJ, headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"}, timeout=30)
+        r.raise_for_status()
+        js = r.json()
+        if (js or {}).get("injuries"):
+            return js
+        print("  injuries direct returned no groups, trying proxy")
+    except Exception as e:
+        print("  injuries direct failed, trying proxy:", e)
+    return get_url(ESPN_INJ)
+
+
+def parse_injuries(js):
+    res = {}
+    groups = (js or {}).get("injuries") or []
+    for grp in groups:
+        items = grp.get("injuries") if isinstance(grp, dict) else None
+        if items is None:
+            items = [grp]
+        for it in (items or []):
+            if not isinstance(it, dict):
+                continue
+            ath = it.get("athlete") or {}
+            nm = ath.get("displayName") or ath.get("fullName") or ath.get("shortName")
+            if not nm:
+                continue
+            status = (it.get("status") or "").strip()
+            if not status:
+                typ = it.get("type") or {}
+                if isinstance(typ, dict):
+                    status = (typ.get("description") or typ.get("name") or "").strip()
+            detail = it.get("shortComment") or it.get("longComment") or ""
+            k = pbnorm(nm)
+            if k:
+                res[k] = {"status": status, "detail": (detail or "")[:180]}
+    return res
+
+
 def num(v):
     if v is None or v == "":
         return None
@@ -219,6 +291,8 @@ def main():
     except Exception as e:
         errors["scoring"] = str(e)
 
+    # Per-game logs (recent games) -> powers L10 hit-rate + out/usage flags.
+    # PerMode=Totals gives each game's actual raw stat line.
     def ingest_logs(js):
         tmp = {}
         for r in rows(js):
@@ -292,10 +366,28 @@ def main():
     except Exception as e:
         errors["teamZoneDef"] = str(e)
 
+    # Real player availability from ESPN (Out / Doubtful / Questionable / Day-To-Day).
+    inj_map, inj_matched = {}, 0
+    try:
+        inj_map = parse_injuries(fetch_injuries_raw())
+    except Exception as e:
+        errors["injuries"] = str(e)
+    if inj_map:
+        for _pl in players.values():
+            _nm = _pl.get("name")
+            if not _nm:
+                continue
+            _st = inj_map.get(pbnorm(_nm))
+            if _st:
+                _pl["injStatus"] = _st["status"]
+                if _st.get("detail"):
+                    _pl["injDetail"] = _st["detail"]
+                inj_matched += 1
+
     out = {
         "updated": datetime.datetime.utcnow().isoformat() + "Z",
         "season": SEASON, "gameDate": game_date,
-        "counts": {"games": len(games), "players": len(players), "teams": len(teams)},
+        "counts": {"games": len(games), "players": len(players), "teams": len(teams), "injListed": len(inj_map), "injMatched": inj_matched},
         "games": games, "teams": teams, "players": players,
     }
     if errors:
