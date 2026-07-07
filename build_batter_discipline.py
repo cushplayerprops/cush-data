@@ -11,9 +11,6 @@ import csv, io, json, sys, datetime, urllib.request
 YEAR = datetime.date.today().year
 
 def savant_url(year, min_pa=25):
-    # Metrics chosen so the app can build an opponent-discipline factor:
-    #   oz_swing_percent = chase (O-Swing%)   whiff_percent = whiffs/swing
-    #   swing_percent, k_percent, in/out-zone contact%
     sels = "pa,k_percent,swing_percent,whiff_percent,oz_swing_percent,iz_contact_percent,oz_contact_percent"
     return ("https://baseballsavant.mlb.com/leaderboard/custom"
             "?year=%d&type=batter&filter=&min=%d"
@@ -26,7 +23,9 @@ def fetch_csv(url):
         "Accept": "text/csv,application/csv,*/*",
     })
     with urllib.request.urlopen(req, timeout=90) as r:
-        return r.read().decode("utf-8", "replace")
+        # utf-8-sig strips the BOM Savant prepends, which otherwise mis-splits
+        # the first ("last_name, first_name") column and shifts every field over.
+        return r.read().decode("utf-8-sig", "replace")
 
 def num(x):
     try:
@@ -37,7 +36,6 @@ def num(x):
         return None
 
 def col(row, *names):
-    # flexible header match (Savant occasionally tweaks column names)
     low = {(k or "").strip().lower(): v for k, v in row.items()}
     for n in names:
         if n in low:
@@ -65,7 +63,6 @@ def build(year):
         izc   = num(col(row, "iz_contact_percent", "in_zone_contact_percent"))
         ozc   = num(col(row, "oz_contact_percent", "out_zone_contact_percent"))
         pa    = num(col(row, "pa", "b_total_pa", "plate_appearances"))
-        # overall contact% per swing = 100 - whiff% (whiff = whiffs / swings)
         contact = (round(100.0 - whiff, 1)) if whiff is not None else None
         if chase is None and whiff is None and kpct is None:
             continue
@@ -88,7 +85,6 @@ def main():
     except Exception as e:
         print("primary fetch failed:", e)
         data = {}
-    # early in the season this year can be thin -> fall back to last year
     if len(data) < 50 and year > 2015:
         print("sparse (%d) for %d; trying %d" % (len(data), year, year - 1))
         try:
@@ -99,7 +95,6 @@ def main():
             print("prev-year fetch failed:", e)
 
     if not data:
-        # never overwrite a good file with an empty one
         print("ERROR: no batters parsed; leaving existing file untouched")
         sys.exit(1)
 
