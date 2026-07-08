@@ -187,11 +187,26 @@ def parse_injuries(js):
             nm = ath.get("displayName") or ath.get("fullName") or ath.get("shortName")
             if not nm:
                 continue
-            status = (it.get("status") or "").strip()
+            # ESPN's top-level "status" is coarse and often reads "Out" even for
+            # questionable/day-to-day players. The granular truth is in type.abbreviation
+            # (O / D / Q / DD) and type.name (INJURY_STATUS_*). Prefer those.
+            typ = it.get("type") or {}
+            abbr = (typ.get("abbreviation") or "").upper().strip()
+            tname = (typ.get("name") or "").upper()
+            ABBR = {"O": "Out", "D": "Doubtful", "Q": "Questionable",
+                    "DD": "Day-To-Day", "DTD": "Day-To-Day", "GTD": "Day-To-Day"}
+            status = ABBR.get(abbr)
+            if not status and tname:
+                if "OUT" in tname:
+                    status = "Out"
+                elif "DOUBT" in tname:
+                    status = "Doubtful"
+                elif "QUESTION" in tname:
+                    status = "Questionable"
+                elif "DAYTODAY" in tname or "DAY_TO_DAY" in tname or "DAY-TO-DAY" in tname:
+                    status = "Day-To-Day"
             if not status:
-                typ = it.get("type") or {}
-                if isinstance(typ, dict):
-                    status = (typ.get("description") or typ.get("name") or "").strip()
+                status = (it.get("status") or "").strip()  # last-resort fallback
             detail = it.get("shortComment") or it.get("longComment") or ""
             k = pbnorm(nm)
             if k:
