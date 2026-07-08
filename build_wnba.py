@@ -344,6 +344,13 @@ def main():
             t["oppFg3a"] = num(r.get("OPP_FG3A"))
             t["oppFg3Pct"] = num(r.get("OPP_FG3_PCT"))
             t["oppFta"] = num(r.get("OPP_FTA"))
+            # opponent assist rate = share of allowed FGs that were assisted.
+            # low = this defense forces self-creation (good spot for a self-creator).
+            _oa, _of = r.get("OPP_AST"), r.get("OPP_FGM")
+            try:
+                t["oppAstRate"] = round(float(_oa) / float(_of), 3) if (_oa not in (None, "") and _of not in (None, "", 0)) else None
+            except Exception:
+                t["oppAstRate"] = None
     except Exception as e:
         errors["teamOpp"] = str(e)
 
