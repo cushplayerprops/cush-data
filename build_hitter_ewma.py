@@ -1,52 +1,83 @@
 #!/usr/bin/env python3
 """
-build_hitter_ewma.py  ->  hitter_ewma.json
+build_hitter_ewma.py  ->  hitter_ewma.json  +  hitter_l30_vsr.json
 
-Recency feed for the Cush hitter model. For every hitter on an active roster it
-pulls per-game xwOBA from Baseball Savant, computes a PA-weighted EWMA
-(exponentially-weighted moving average), and writes one record per player id:
-
-    "660271": { "ewma": 0.3584, "season": 0.3310, "effPa": 142.0 }
-
-  ewma   = recency-weighted xwOBA (recent PAs weighted more; half-life below)
-  season = full-season xwOBA, SAME definition (so the front-end can compare cleanly)
-  effPa  = effective plate appearances behind the EWMA (sum of decayed weights).
-           The app regresses the recency tilt by effPa/(effPa+REC_K), so low-sample
-           hitters barely move off their season number -- no extra filtering needed.
-
-The front-end (deploy with HITTER_EWMA_URL wired) reads this and applies an additive
-xwOBA recency tilt to the hitter index, with an EXACT season fallback when a hitter
-is missing or has effPa<=0. Absent feed => model behaves exactly as before.
-
-DESIGN NOTES (the choices that matter for accuracy):
-  * Metric = xwOBA, not wOBA. xwOBA strips batted-ball luck, is more predictive of
-    future production, and stabilizes faster -> a better recency signal.
-  * HALF_LIFE_PA = 250 (~last 60 games). Backtest-tuned: long+regressed wins. A short, streaky
-    half-life feels clever but backtests WORSE -- it chases noise. Long + regressed
-    captures genuine change (swing/health/role) while staying anchored to true talent.
-  * Weighting is per-PA, not per-game, so a 5-PA day counts more than a 2-PA day.
-  * This is an EDUCATED default. The only way to truly maximize accuracy is to backtest
-    HALF_LIFE_PA (and the app's REC_K) against held-out games. Treat these as a strong
-    starting point, then tune.
-
-DEPENDENCIES: standard library only (urllib, csv, json, time). No API key.
-
-DEPLOY: run this, push hitter_ewma.json to the ROOT of the main branch of
-cushplayerprops/cush-data, add to the daily cron. If you already pull Statcast for
-your BPI build, the cheapest path is to compute the EWMA from THAT cached event data
-(reuse `game_xwoba_series` + `ewma_from_games` below) instead of re-pulling here.
+Recency feed for the Cush hitter model (xwOBA EWMA), plus a last-30-days
+vs-RHP slash line computed from the SAME Savant pull (no extra API calls).
 """
 
 import csv, io, json, sys, time, urllib.request, urllib.error
+from datetime import date, timedelta
 
 SEASON         = 2026
-HALF_LIFE_PA   = 250          # EWMA half-life in plate appearances
+HALF_LIFE_PA   = 250
 MLB_BASE       = "https://statsapi.mlb.com/api/v1"
 SAVANT_CSV     = "https://baseballsavant.mlb.com/statcast_search/csv"
 OUT_PATH       = "hitter_ewma.json"
-REQUEST_PAUSE  = 1.2          # seconds between Savant pulls (be polite; it rate-limits)
+OUT_L30        = "hitter_l30_vsr.json"
+L30_DAYS       = 30
+L30_MIN_PA     = 1
+REQUEST_PAUSE  = 1.2
 TIMEOUT        = 60
-LAMBDA         = 0.5 ** (1.0 / HALF_LIFE_PA)   # per-PA decay factor
+LAMBDA         = 0.5 ** (1.0 / HALF_LIFE_PA)
+
+_L30_NON_PA = {
+    "caught_stealing_2b", "caught_stealing_3b", "caught_stealing_home",
+    "pickoff_1b", "pickoff_2b", "pickoff_3b",
+    "pickoff_caught_stealing_2b", "pickoff_caught_stealing_3b", "pickoff_caught_stealing_home",
+    "stolen_base_2b", "stolen_base_3b", "stolen_base_home", "stolen_base",
+    "wild_pitch", "passed_ball", "balk", "other_advance", "runner_double_play",
+    "game_advisory", "batter_timeout",
+}
+
+
+def l30_vsr_slash(csv_text, start_iso):
+    rdr = csv.DictReader(io.StringIO(csv_text))
+    PA = AB = H = TB = BB = SO = HBP = SF = 0
+    for row in rdr:
+        gd = row.get("game_date", "")
+        if start_iso and (not gd or gd < start_iso):
+            continue
+        if (row.get("p_throws") or "") != "R":
+            continue
+        ev = (row.get("events") or "").strip()
+        if not ev or ev in _L30_NON_PA:
+            continue
+        PA += 1
+        if ev in ("walk", "intent_walk"):
+            BB += 1
+        elif ev == "hit_by_pitch":
+            HBP += 1
+        elif ev in ("sac_fly", "sac_fly_double_play"):
+            SF += 1
+        elif ev in ("sac_bunt", "sacrifice_bunt_double_play", "batter_interference", "catcher_interf"):
+            pass
+        else:
+            AB += 1
+            if ev == "single":
+                H += 1; TB += 1
+            elif ev == "double":
+                H += 1; TB += 2
+            elif ev == "triple":
+                H += 1; TB += 3
+            elif ev == "home_run":
+                H += 1; TB += 4
+            if ev in ("strikeout", "strikeout_double_play"):
+                SO += 1
+    if PA < L30_MIN_PA or AB <= 0:
+        return None
+    avg = H / AB
+    obp_den = AB + BB + HBP + SF
+    obp = (H + BB + HBP) / obp_den if obp_den > 0 else 0.0
+    slg = TB / AB
+    ops = obp + slg
+    return {
+        "wrcPlus": round((ops / 0.720) * 100) if ops > 0 else None,
+        "iso": "%.3f" % (slg - avg),
+        "kPct": "%.1f" % (SO / PA * 100.0),
+        "bbPct": "%.1f" % (BB / PA * 100.0),
+        "pa": PA,
+    }
 
 UA = {"User-Agent": "Mozilla/5.0 (cush-ewma-build)"}
 
@@ -58,7 +89,7 @@ def _get(url, tries=3):
             req = urllib.request.Request(url, headers=UA)
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 return r.read().decode("utf-8", "replace")
-        except Exception as e:                       # noqa
+        except Exception as e:
             last = e
             time.sleep(2.0 * (k + 1))
     print("  ! fetch failed:", last, file=sys.stderr)
@@ -66,21 +97,18 @@ def _get(url, tries=3):
 
 
 def active_hitter_ids():
-    """Every position player / two-way bat on a current active roster."""
     ids = {}
     teams = json.loads(_get(MLB_BASE + "/teams?sportId=1") or '{"teams":[]}')["teams"]
     for t in teams:
         tid = t["id"]
-        url = "%s/teams/%d/roster?rosterType=active" % (MLB_BASE, tid)
-        data = _get(url)
+        data = _get("%s/teams/%d/roster?rosterType=active" % (MLB_BASE, tid))
         if not data:
             continue
         for p in json.loads(data).get("roster", []):
             pos = (p.get("position") or {}).get("abbreviation", "")
-            if pos in ("P",):          # skip pitchers; keep DH/IF/OF/C/TWP
+            if pos in ("P",):
                 continue
-            pid = p["person"]["id"]
-            ids[pid] = p["person"].get("fullName", "")
+            ids[p["person"]["id"]] = p["person"].get("fullName", "")
         time.sleep(0.05)
     return ids
 
@@ -103,19 +131,11 @@ def _f(x):
 
 
 def game_xwoba_series(csv_text):
-    """
-    Parse a Savant per-pitch CSV into per-game xwOBA.
-    Returns list of (game_date, xwoba_game, pa_game) and the season (xwoba, pa) totals.
-
-    xwOBA per PA = estimated_woba_using_speedangle on batted balls,
-                   else woba_value (BB/HBP/K and other PA outcomes).
-    Denominator  = woba_denom (1 for PAs that count toward wOBA).
-    """
-    games = {}                       # game_pk -> [date, xnum_sum, denom_sum]
+    games = {}
     rdr = csv.DictReader(io.StringIO(csv_text))
     for row in rdr:
         denom = _f(row.get("woba_denom"))
-        if not denom:                # 0 / blank -> doesn't count
+        if not denom:
             continue
         est = _f(row.get("estimated_woba_using_speedangle"))
         wv  = _f(row.get("woba_value"))
@@ -125,7 +145,6 @@ def game_xwoba_series(csv_text):
             games[gpk] = [row.get("game_date", ""), 0.0, 0.0]
         games[gpk][1] += xnum
         games[gpk][2] += denom
-
     series, s_num, s_den = [], 0.0, 0.0
     for gpk, (d, xn, dn) in games.items():
         if dn <= 0:
@@ -133,16 +152,15 @@ def game_xwoba_series(csv_text):
         series.append((d, xn / dn, dn))
         s_num += xn
         s_den += dn
-    series.sort(key=lambda r: r[0])  # chronological
+    series.sort(key=lambda r: r[0])
     season = (s_num / s_den, s_den) if s_den > 0 else (None, 0.0)
     return series, season
 
 
 def ewma_from_games(series):
-    """PA-weighted EWMA over chronological [(date, xwoba_game, pa_game), ...]."""
     S = W = 0.0
     decay = 1.0
-    for _, x, pa in reversed(series):      # newest -> oldest
+    for _, x, pa in reversed(series):
         w = decay * pa
         S += w * x
         W += w
@@ -157,12 +175,32 @@ def main():
     ids = active_hitter_ids()
     print("  %d hitters" % len(ids), file=sys.stderr)
 
+    end_d = date.today()
+    start_iso = (end_d - timedelta(days=L30_DAYS)).isoformat()
+    print("L30 vs-RHP window: %s .. %s" % (start_iso, end_d.isoformat()), file=sys.stderr)
+
     out = {}
+    l30_out = {}
+    _hdr_logged = False
+    l30_samples = []
     for n, (pid, name) in enumerate(sorted(ids.items()), 1):
         csv_text = _get(savant_csv_url(pid))
         time.sleep(REQUEST_PAUSE)
         if not csv_text or "game_pk" not in csv_text.split("\n", 1)[0]:
             continue
+
+        if not _hdr_logged:
+            hdr = csv_text.split("\n", 1)[0]
+            print("CSV header check -> p_throws:%s events:%s game_date:%s"
+                  % ("p_throws" in hdr, "events" in hdr, "game_date" in hdr), file=sys.stderr)
+            _hdr_logged = True
+        l30 = l30_vsr_slash(csv_text, start_iso)
+        if l30:
+            l30_out[str(pid)] = l30
+            if len(l30_samples) < 6:
+                seas = l30_vsr_slash(csv_text, "")
+                l30_samples.append((str(pid), name, l30, (seas or {}).get("pa")))
+
         series, (season_x, _) = game_xwoba_series(csv_text)
         if not series or season_x is None:
             continue
@@ -179,8 +217,15 @@ def main():
 
     with open(OUT_PATH, "w") as f:
         json.dump(out, f, separators=(",", ":"))
-    print("wrote %s : %d hitters (half-life %d PA)" %
-          (OUT_PATH, len(out), HALF_LIFE_PA), file=sys.stderr)
+    print("wrote %s : %d hitters (half-life %d PA)" % (OUT_PATH, len(out), HALF_LIFE_PA), file=sys.stderr)
+
+    with open(OUT_L30, "w") as f:
+        json.dump(l30_out, f, separators=(",", ":"))
+    print("wrote %s : %d hitters (last-%d-days vs RHP)" % (OUT_L30, len(l30_out), L30_DAYS), file=sys.stderr)
+    for pid, name, l30, seaspa in l30_samples:
+        print("  sample %s %s: L30vsR PA=%s wRC+=%s ISO=%s K%%=%s BB%%=%s  |  seasonvsR PA=%s"
+              % (pid, name, l30.get("pa"), l30.get("wrcPlus"), l30.get("iso"),
+                 l30.get("kPct"), l30.get("bbPct"), seaspa), file=sys.stderr)
 
 
 if __name__ == "__main__":
