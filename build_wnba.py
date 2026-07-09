@@ -316,6 +316,7 @@ def main():
                 continue
             p = players[pid]
             p["ast3Pct"] = num(r.get("PCT_AST_3PM"))
+            p["ast2Pct"] = num(r.get("PCT_AST_2PM"))
             p["astFgPct"] = num(r.get("PCT_AST_FGM"))
 
     try:
@@ -364,7 +365,7 @@ def main():
             if pid is None:
                 continue
             mn = num(r.get("MIN"))
-            fga = num(r.get("FGA")); fg3a = num(r.get("FG3A")); ftm = num(r.get("FTM")); pts = num(r.get("PTS"))
+            fga = num(r.get("FGA")); fg3a = num(r.get("FG3A")); ftm = num(r.get("FTM")); fta = num(r.get("FTA")); pts = num(r.get("PTS"))
             reb = num(r.get("REB")); ast = num(r.get("AST"))
             stl = num(r.get("STL")); blk = num(r.get("BLK")); tov = num(r.get("TOV"))
             tmp.setdefault(pid, []).append({
@@ -387,12 +388,13 @@ def main():
                     opp = mu.split(sep)[-1].strip()
                     break
             if pos and opp and (mn or 0) >= 1:
-                d = dvp_acc.setdefault(opp, {}).setdefault(pos, {"gp": 0, "fga": 0.0, "fg3a": 0.0, "twopa": 0.0, "ftm": 0.0, "fs": 0.0})
+                d = dvp_acc.setdefault(opp, {}).setdefault(pos, {"gp": 0, "fga": 0.0, "fg3a": 0.0, "twopa": 0.0, "ftm": 0.0, "fta": 0.0, "fs": 0.0})
                 d["gp"] += 1
                 d["fga"] += (fga or 0)
                 d["fg3a"] += (fg3a or 0)
                 d["twopa"] += ((fga or 0) - (fg3a or 0))
                 d["ftm"] += (ftm or 0)
+                d["fta"] += (fta or 0)
                 d["fs"] += _fs(pts, reb, ast, stl, blk, tov)
         for pid, gl in tmp.items():
             gl.sort(key=lambda g: (g.get("d") or ""), reverse=True)
@@ -475,6 +477,7 @@ def main():
                 "fg3a": round(d["fg3a"] / gp, 2),
                 "twopa": round(d["twopa"] / gp, 2),
                 "ftm": round(d["ftm"] / gp, 2),
+                "fta": round(d["fta"] / gp, 2),
                 "fs": round(d["fs"] / gp, 2),
             }
         if dvp:
