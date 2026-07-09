@@ -173,6 +173,42 @@ def fetch_injuries_raw():
     return get_url(ESPN_INJ)
 
 
+def classify_injury(detail, it):
+    """WNBA feed's top-level 'status' AND type field are coarse -- both read 'Out'
+    even for questionable/day-to-day players. The beat-writer comment is the one field
+    that reliably distinguishes them, so classify from it first, then fall back."""
+    dl = (detail or "").lower()
+    if "questionable" in dl:
+        return "Questionable"
+    if "doubtful" in dl:
+        return "Doubtful"
+    if ("day-to-day" in dl or "day to day" in dl or "game-time decision" in dl or "game time decision" in dl):
+        return "Day-To-Day"
+    if "probable" in dl and "improbable" not in dl:
+        return "Probable"
+    if re.search(r"\bout\b", dl) or any(kw in dl for kw in (
+            "will miss", "sidelined", "re-evaluated", "reevaluated", "remainder of the season",
+            "won't return", "will not play", "won't play", "inactive", "did not return", "torn acl")):
+        return "Out"
+    # comment said nothing decisive -> fall back to the coarse type / status fields
+    typ = (it or {}).get("type") or {}
+    abbr = (typ.get("abbreviation") or "").upper().strip()
+    tname = (typ.get("name") or "").upper()
+    ABBR = {"O": "Out", "D": "Doubtful", "Q": "Questionable",
+            "DD": "Day-To-Day", "DTD": "Day-To-Day", "GTD": "Day-To-Day"}
+    if abbr in ABBR:
+        return ABBR[abbr]
+    if "QUESTION" in tname:
+        return "Questionable"
+    if "DOUBT" in tname:
+        return "Doubtful"
+    if "DAYTODAY" in tname or "DAY_TO_DAY" in tname:
+        return "Day-To-Day"
+    if "OUT" in tname:
+        return "Out"
+    return ((it or {}).get("status") or "").strip() or "Out"
+
+
 def parse_injuries(js):
     res = {}
     groups = (js or {}).get("injuries") or []
@@ -187,27 +223,8 @@ def parse_injuries(js):
             nm = ath.get("displayName") or ath.get("fullName") or ath.get("shortName")
             if not nm:
                 continue
-            # ESPN's top-level "status" is coarse and often reads "Out" even for
-            # questionable/day-to-day players. The granular truth is in type.abbreviation
-            # (O / D / Q / DD) and type.name (INJURY_STATUS_*). Prefer those.
-            typ = it.get("type") or {}
-            abbr = (typ.get("abbreviation") or "").upper().strip()
-            tname = (typ.get("name") or "").upper()
-            ABBR = {"O": "Out", "D": "Doubtful", "Q": "Questionable",
-                    "DD": "Day-To-Day", "DTD": "Day-To-Day", "GTD": "Day-To-Day"}
-            status = ABBR.get(abbr)
-            if not status and tname:
-                if "OUT" in tname:
-                    status = "Out"
-                elif "DOUBT" in tname:
-                    status = "Doubtful"
-                elif "QUESTION" in tname:
-                    status = "Questionable"
-                elif "DAYTODAY" in tname or "DAY_TO_DAY" in tname or "DAY-TO-DAY" in tname:
-                    status = "Day-To-Day"
-            if not status:
-                status = (it.get("status") or "").strip()  # last-resort fallback
             detail = it.get("shortComment") or it.get("longComment") or ""
+            status = classify_injury(detail, it)
             k = pbnorm(nm)
             if k:
                 res[k] = {"status": status, "detail": (detail or "")[:180]}
@@ -306,6 +323,38 @@ def main():
     except Exception as e:
         errors["scoring"] = str(e)
 
+    # Player positions (single call) -> G/F/C bucket. Needed for defense-vs-position aggregation.
+    def pos_bucket(s):
+        head = (s or "").upper().strip().split("-")[0].strip()
+        if head.startswith("G"):
+            return "G"
+        if head.startswith("F"):
+            return "F"
+        if head.startswith("C"):
+            return "C"
+        return None
+
+    try:
+        pidx = get("/playerindex", {
+            "College": "", "Country": "", "DraftPick": "", "DraftRound": "", "DraftYear": "",
+            "Height": "", "Historical": "0", "LeagueID": LEAGUE, "Season": SEASON,
+            "SeasonType": "Regular Season", "TeamID": "0", "Weight": "", "Active": "", "AllStar": "",
+        })
+        for r in rows(pidx):
+            pid = r.get("PERSON_ID")
+            b = pos_bucket(r.get("POSITION"))
+            if pid in players and b:
+                players[pid]["pos"] = b
+    except Exception as e:
+        errors["positions"] = str(e)
+
+    # defense-vs-position accumulator: opp_abbr -> pos -> running totals (filled during ingest_logs)
+    dvp_acc = {}
+
+    def _fs(pts, reb, ast, stl, blk, tov):
+        # PrizePicks WNBA fantasy score
+        return (pts or 0) + 1.2 * (reb or 0) + 1.5 * (ast or 0) + 3 * (stl or 0) + 3 * (blk or 0) - (tov or 0)
+
     # Per-game logs (recent games) -> powers L10 hit-rate + out/usage flags.
     # PerMode=Totals gives each game's actual raw stat line.
     def ingest_logs(js):
@@ -314,16 +363,37 @@ def main():
             pid = r.get("PLAYER_ID")
             if pid is None:
                 continue
+            mn = num(r.get("MIN"))
+            fga = num(r.get("FGA")); fg3a = num(r.get("FG3A")); ftm = num(r.get("FTM")); pts = num(r.get("PTS"))
+            reb = num(r.get("REB")); ast = num(r.get("AST"))
+            stl = num(r.get("STL")); blk = num(r.get("BLK")); tov = num(r.get("TOV"))
             tmp.setdefault(pid, []).append({
                 "d": r.get("GAME_DATE"),
-                "min": num(r.get("MIN")),
-                "fga": num(r.get("FGA")),
-                "fg3a": num(r.get("FG3A")),
+                "min": mn,
+                "fga": fga,
+                "fg3a": fg3a,
                 "fg3m": num(r.get("FG3M")),
-                "pts": num(r.get("PTS")),
-                "ftm": num(r.get("FTM")),
+                "pts": pts,
+                "ftm": ftm,
                 "fta": num(r.get("FTA")),
+                "reb": reb, "ast": ast, "stl": stl, "blk": blk, "tov": tov,
             })
+            # defense-vs-position: attribute this opposing line to the defense (the opponent)
+            pos = (players.get(pid) or {}).get("pos")
+            mu = r.get("MATCHUP") or ""
+            opp = None
+            for sep in (" @ ", " vs. ", " vs "):
+                if sep in mu:
+                    opp = mu.split(sep)[-1].strip()
+                    break
+            if pos and opp and (mn or 0) >= 1:
+                d = dvp_acc.setdefault(opp, {}).setdefault(pos, {"gp": 0, "fga": 0.0, "fg3a": 0.0, "twopa": 0.0, "ftm": 0.0, "fs": 0.0})
+                d["gp"] += 1
+                d["fga"] += (fga or 0)
+                d["fg3a"] += (fg3a or 0)
+                d["twopa"] += ((fga or 0) - (fg3a or 0))
+                d["ftm"] += (ftm or 0)
+                d["fs"] += _fs(pts, reb, ast, stl, blk, tov)
         for pid, gl in tmp.items():
             gl.sort(key=lambda g: (g.get("d") or ""), reverse=True)
             recent = gl[:12]
@@ -388,6 +458,28 @@ def main():
     except Exception as e:
         errors["teamZoneDef"] = str(e)
 
+    # attach defense-vs-position per-game allowances (G/F/C) to each team
+    abbr2id = {v: k for k, v in id2abbr.items()}
+    for opp_abbr, posmap in dvp_acc.items():
+        tid = abbr2id.get(opp_abbr)
+        if tid is None or tid not in teams:
+            continue
+        dvp = {}
+        for pos, d in posmap.items():
+            gp = d.get("gp") or 0
+            if gp <= 0:
+                continue
+            dvp[pos] = {
+                "gp": gp,
+                "fga": round(d["fga"] / gp, 2),
+                "fg3a": round(d["fg3a"] / gp, 2),
+                "twopa": round(d["twopa"] / gp, 2),
+                "ftm": round(d["ftm"] / gp, 2),
+                "fs": round(d["fs"] / gp, 2),
+            }
+        if dvp:
+            teams[tid]["dvp"] = dvp
+
     # Real player availability from ESPN (Out / Doubtful / Questionable / Day-To-Day).
     inj_map, inj_matched = {}, 0
     try:
@@ -409,7 +501,7 @@ def main():
     out = {
         "updated": datetime.datetime.utcnow().isoformat() + "Z",
         "season": SEASON, "gameDate": game_date,
-        "counts": {"games": len(games), "players": len(players), "teams": len(teams), "injListed": len(inj_map), "injMatched": inj_matched},
+        "counts": {"games": len(games), "players": len(players), "teams": len(teams), "injListed": len(inj_map), "injMatched": inj_matched, "posMatched": sum(1 for p in players.values() if p.get("pos")), "dvpTeams": sum(1 for t in teams.values() if t.get("dvp"))},
         "games": games, "teams": teams, "players": players,
     }
     if errors:
