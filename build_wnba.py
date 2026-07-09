@@ -280,6 +280,11 @@ def main():
             p[prefix + "ftm"] = num(r.get("FTM"))
             p[prefix + "fta"] = num(r.get("FTA"))
             p[prefix + "ftPct"] = num(r.get("FT_PCT"))
+            p[prefix + "reb"] = num(r.get("REB"))
+            p[prefix + "ast"] = num(r.get("AST"))
+            p[prefix + "stl"] = num(r.get("STL"))
+            p[prefix + "blk"] = num(r.get("BLK"))
+            p[prefix + "tov"] = num(r.get("TOV"))
 
     try:
         ingest(get("/leaguedashplayerstats", dash({"LastNGames": "0"})), "")
