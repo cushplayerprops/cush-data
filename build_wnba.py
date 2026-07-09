@@ -393,7 +393,7 @@ def main():
                     opp = mu.split(sep)[-1].strip()
                     break
             if pos and opp and (mn or 0) >= 1:
-                d = dvp_acc.setdefault(opp, {}).setdefault(pos, {"gp": 0, "fga": 0.0, "fg3a": 0.0, "twopa": 0.0, "ftm": 0.0, "fta": 0.0, "fs": 0.0})
+                d = dvp_acc.setdefault(opp, {}).setdefault(pos, {"gp": 0, "fga": 0.0, "fg3a": 0.0, "twopa": 0.0, "ftm": 0.0, "fta": 0.0, "fs": 0.0, "pts": 0.0, "reb": 0.0, "ast": 0.0, "stl": 0.0, "blk": 0.0, "tov": 0.0})
                 d["gp"] += 1
                 d["fga"] += (fga or 0)
                 d["fg3a"] += (fg3a or 0)
@@ -401,6 +401,12 @@ def main():
                 d["ftm"] += (ftm or 0)
                 d["fta"] += (fta or 0)
                 d["fs"] += _fs(pts, reb, ast, stl, blk, tov)
+                d["pts"] += (pts or 0)
+                d["reb"] += (reb or 0)
+                d["ast"] += (ast or 0)
+                d["stl"] += (stl or 0)
+                d["blk"] += (blk or 0)
+                d["tov"] += (tov or 0)
         for pid, gl in tmp.items():
             gl.sort(key=lambda g: (g.get("d") or ""), reverse=True)
             recent = gl[:12]
@@ -484,6 +490,12 @@ def main():
                 "ftm": round(d["ftm"] / gp, 2),
                 "fta": round(d["fta"] / gp, 2),
                 "fs": round(d["fs"] / gp, 2),
+                "pts": round(d["pts"] / gp, 2),
+                "reb": round(d["reb"] / gp, 2),
+                "ast": round(d["ast"] / gp, 2),
+                "stl": round(d["stl"] / gp, 2),
+                "blk": round(d["blk"] / gp, 2),
+                "tov": round(d["tov"] / gp, 2),
             }
         if dvp:
             teams[tid]["dvp"] = dvp
