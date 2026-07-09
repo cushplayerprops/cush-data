@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-build_hitter_ewma.py  ->  hitter_ewma.json  +  hitter_l30_vsr.json
+build_hitter_ewma.py  ->  hitter_ewma.json  +  hitter_recent.json
 
-Recency feed for the Cush hitter model (xwOBA EWMA), plus a last-30-days
-vs-RHP slash line computed from the SAME Savant pull (no extra API calls).
+xwOBA EWMA recency feed, plus a last-N-plate-appearance slash line PER HAND
+(vs RHP and vs LHP) computed from the same Savant pull. Fixed sample size =>
+stable reliability, and vs-LHP just reaches further back to gather its N.
 """
 
 import csv, io, json, sys, time, urllib.request, urllib.error
@@ -14,14 +15,14 @@ HALF_LIFE_PA   = 250
 MLB_BASE       = "https://statsapi.mlb.com/api/v1"
 SAVANT_CSV     = "https://baseballsavant.mlb.com/statcast_search/csv"
 OUT_PATH       = "hitter_ewma.json"
-OUT_L30        = "hitter_l30_vsr.json"
-L30_DAYS       = 30
-L30_MIN_PA     = 1
+OUT_RECENT     = "hitter_recent.json"
+RECENT_PA      = 40
+RECENT_MIN_PA  = 8
 REQUEST_PAUSE  = 1.2
 TIMEOUT        = 60
 LAMBDA         = 0.5 ** (1.0 / HALF_LIFE_PA)
 
-_L30_NON_PA = {
+_NON_PA = {
     "caught_stealing_2b", "caught_stealing_3b", "caught_stealing_home",
     "pickoff_1b", "pickoff_2b", "pickoff_3b",
     "pickoff_caught_stealing_2b", "pickoff_caught_stealing_3b", "pickoff_caught_stealing_home",
@@ -31,18 +32,9 @@ _L30_NON_PA = {
 }
 
 
-def l30_vsr_slash(csv_text, start_iso):
-    rdr = csv.DictReader(io.StringIO(csv_text))
+def _slash_from_events(events):
     PA = AB = H = TB = BB = SO = HBP = SF = 0
-    for row in rdr:
-        gd = row.get("game_date", "")
-        if start_iso and (not gd or gd < start_iso):
-            continue
-        if (row.get("p_throws") or "") != "R":
-            continue
-        ev = (row.get("events") or "").strip()
-        if not ev or ev in _L30_NON_PA:
-            continue
+    for ev in events:
         PA += 1
         if ev in ("walk", "intent_walk"):
             BB += 1
@@ -64,7 +56,7 @@ def l30_vsr_slash(csv_text, start_iso):
                 H += 1; TB += 4
             if ev in ("strikeout", "strikeout_double_play"):
                 SO += 1
-    if PA < L30_MIN_PA or AB <= 0:
+    if PA < RECENT_MIN_PA or AB <= 0:
         return None
     avg = H / AB
     obp_den = AB + BB + HBP + SF
@@ -78,6 +70,28 @@ def l30_vsr_slash(csv_text, start_iso):
         "bbPct": "%.1f" % (BB / PA * 100.0),
         "pa": PA,
     }
+
+
+def last_n_slash(csv_text, phand, n):
+    rdr = csv.DictReader(io.StringIO(csv_text))
+    pas = []
+    for row in rdr:
+        if (row.get("p_throws") or "") != phand:
+            continue
+        ev = (row.get("events") or "").strip()
+        if not ev or ev in _NON_PA:
+            continue
+        gd = row.get("game_date", "")
+        try:
+            abn = int(row.get("at_bat_number") or 0)
+        except (TypeError, ValueError):
+            abn = 0
+        pas.append((gd, abn, ev))
+    if not pas:
+        return None
+    pas.sort(key=lambda x: (x[0], x[1]))
+    recent = [p[2] for p in (pas[-n:] if len(pas) > n else pas)]
+    return _slash_from_events(recent)
 
 UA = {"User-Agent": "Mozilla/5.0 (cush-ewma-build)"}
 
@@ -100,8 +114,7 @@ def active_hitter_ids():
     ids = {}
     teams = json.loads(_get(MLB_BASE + "/teams?sportId=1") or '{"teams":[]}')["teams"]
     for t in teams:
-        tid = t["id"]
-        data = _get("%s/teams/%d/roster?rosterType=active" % (MLB_BASE, tid))
+        data = _get("%s/teams/%d/roster?rosterType=active" % (MLB_BASE, t["id"]))
         if not data:
             continue
         for p in json.loads(data).get("roster", []):
@@ -174,15 +187,12 @@ def main():
     print("collecting active hitters ...", file=sys.stderr)
     ids = active_hitter_ids()
     print("  %d hitters" % len(ids), file=sys.stderr)
-
-    end_d = date.today()
-    start_iso = (end_d - timedelta(days=L30_DAYS)).isoformat()
-    print("L30 vs-RHP window: %s .. %s" % (start_iso, end_d.isoformat()), file=sys.stderr)
+    print("recent window: last %d PA vs each hand" % RECENT_PA, file=sys.stderr)
 
     out = {}
-    l30_out = {}
+    rec_out = {}
     _hdr_logged = False
-    l30_samples = []
+    rec_samples = []
     for n, (pid, name) in enumerate(sorted(ids.items()), 1):
         csv_text = _get(savant_csv_url(pid))
         time.sleep(REQUEST_PAUSE)
@@ -191,15 +201,20 @@ def main():
 
         if not _hdr_logged:
             hdr = csv_text.split("\n", 1)[0]
-            print("CSV header check -> p_throws:%s events:%s game_date:%s"
-                  % ("p_throws" in hdr, "events" in hdr, "game_date" in hdr), file=sys.stderr)
+            print("CSV header check -> p_throws:%s events:%s at_bat_number:%s"
+                  % ("p_throws" in hdr, "events" in hdr, "at_bat_number" in hdr), file=sys.stderr)
             _hdr_logged = True
-        l30 = l30_vsr_slash(csv_text, start_iso)
-        if l30:
-            l30_out[str(pid)] = l30
-            if len(l30_samples) < 6:
-                seas = l30_vsr_slash(csv_text, "")
-                l30_samples.append((str(pid), name, l30, (seas or {}).get("pa")))
+        rL = last_n_slash(csv_text, "L", RECENT_PA)
+        rR = last_n_slash(csv_text, "R", RECENT_PA)
+        if rL or rR:
+            rec = {}
+            if rL:
+                rec["L"] = rL
+            if rR:
+                rec["R"] = rR
+            rec_out[str(pid)] = rec
+            if len(rec_samples) < 6:
+                rec_samples.append((str(pid), name, rR, rL))
 
         series, (season_x, _) = game_xwoba_series(csv_text)
         if not series or season_x is None:
@@ -207,11 +222,7 @@ def main():
         ewma, effpa = ewma_from_games(series)
         if ewma is None or effpa <= 0:
             continue
-        out[str(pid)] = {
-            "ewma":  round(ewma, 4),
-            "season": round(season_x, 4),
-            "effPa": round(effpa, 1),
-        }
+        out[str(pid)] = {"ewma": round(ewma, 4), "season": round(season_x, 4), "effPa": round(effpa, 1)}
         if n % 25 == 0:
             print("  %d/%d  (%d written)" % (n, len(ids), len(out)), file=sys.stderr)
 
@@ -219,13 +230,15 @@ def main():
         json.dump(out, f, separators=(",", ":"))
     print("wrote %s : %d hitters (half-life %d PA)" % (OUT_PATH, len(out), HALF_LIFE_PA), file=sys.stderr)
 
-    with open(OUT_L30, "w") as f:
-        json.dump(l30_out, f, separators=(",", ":"))
-    print("wrote %s : %d hitters (last-%d-days vs RHP)" % (OUT_L30, len(l30_out), L30_DAYS), file=sys.stderr)
-    for pid, name, l30, seaspa in l30_samples:
-        print("  sample %s %s: L30vsR PA=%s wRC+=%s ISO=%s K%%=%s BB%%=%s  |  seasonvsR PA=%s"
-              % (pid, name, l30.get("pa"), l30.get("wrcPlus"), l30.get("iso"),
-                 l30.get("kPct"), l30.get("bbPct"), seaspa), file=sys.stderr)
+    with open(OUT_RECENT, "w") as f:
+        json.dump(rec_out, f, separators=(",", ":"))
+    print("wrote %s : %d hitters (last %d PA per hand)" % (OUT_RECENT, len(rec_out), RECENT_PA), file=sys.stderr)
+
+    def _fmt(x):
+        return ("PA=%s wRC+=%s ISO=%s K%%=%s BB%%=%s"
+                % (x.get("pa"), x.get("wrcPlus"), x.get("iso"), x.get("kPct"), x.get("bbPct"))) if x else "n/a"
+    for pid, name, rR, rL in rec_samples:
+        print("  sample %s %s: vsR[%s]  vsL[%s]" % (pid, name, _fmt(rR), _fmt(rL)), file=sys.stderr)
 
 
 if __name__ == "__main__":
