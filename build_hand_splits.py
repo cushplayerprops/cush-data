@@ -24,6 +24,9 @@ No API key needed. The MLB Stats API is public.
 import json
 import time
 import urllib.request
+from datetime import date, timedelta
+
+L30_DAYS = 30  # last-N-days window for the vs-RHP recency split
 
 SEASON = 2026
 BASE = "https://statsapi.mlb.com/api/v1"
@@ -62,12 +65,18 @@ def parse(stat):
         "iso": f"{slg - avg:.3f}",
         "kPct": f"{so / pa * 100:.1f}",
         "bbPct": f"{bb / pa * 100:.1f}",
+        "pa": pa,
     }
 
 
-def fetch_split(pid, code):
+def fetch_split(pid, code, start=None, end=None):
     url = (f"{BASE}/people/{pid}/stats?stats=statSplits&group=hitting"
            f"&season={SEASON}&gameType=R&sitCodes={code}")
+    if start and end:
+        # Date-bounded split (last-N-days). If the API honors these params the
+        # returned PA will be smaller than the season line; the Action log below
+        # verifies that. If it ignores them, R30 == season R (harmless no-op).
+        url += f"&startDate={start}&endDate={end}"
     j = get(url)
     try:
         stat = j["stats"][0]["splits"][0]["stat"]
@@ -93,13 +102,32 @@ def main():
         time.sleep(SLEEP)
     print(f"{len(hitter_ids)} hitters to fetch")
 
-    # 3) per hitter: vs LHP (vl) and vs RHP (vr)
+    # date window for the last-30-days vs-RHP split
+    end_d = date.today()
+    start_d = end_d - timedelta(days=L30_DAYS)
+    start, end = start_d.isoformat(), end_d.isoformat()
+    print(f"L30 vs-RHP window: {start} .. {end}")
+
+    # 3) per hitter: vs LHP (vl, season), vs RHP (vr, season), vs RHP (vr, last 30 days)
     out = {}
+    chk_both = 0      # hitters with a PA count on both season-R and L30-R
+    chk_fewer = 0     # ...of those, how many have FEWER PA in L30 (proves the date filter worked)
+    sample = []
     for n, pid in enumerate(sorted(hitter_ids), 1):
-        L = fetch_split(pid, "vl")   # vs left-handed pitchers
-        R = fetch_split(pid, "vr")   # vs right-handed pitchers
+        L = fetch_split(pid, "vl")                 # vs left-handed pitchers (season)
+        R = fetch_split(pid, "vr")                 # vs right-handed pitchers (season)
+        R30 = fetch_split(pid, "vr", start, end)   # vs right-handed pitchers (last 30 days)
         if L or R:
-            out[str(pid)] = {"L": L, "R": R}
+            rec = {"L": L, "R": R}
+            if R30:
+                rec["R30"] = R30
+            out[str(pid)] = rec
+        if R and R30 and R.get("pa") and R30.get("pa"):
+            chk_both += 1
+            if R30["pa"] < R["pa"]:
+                chk_fewer += 1
+            if len(sample) < 5:
+                sample.append((str(pid), R["pa"], R30["pa"]))
         if n % 50 == 0:
             print(f"  {n}/{len(hitter_ids)}")
         time.sleep(SLEEP)
@@ -108,6 +136,10 @@ def main():
     with open(OUT_FILE, "w") as f:
         json.dump(out, f, separators=(",", ":"))
     print(f"wrote {OUT_FILE} with {len(out)} hitters")
+    print(f"L30 date-filter check: {chk_fewer}/{chk_both} hitters have FEWER vs-RHP PA in L30 than season")
+    print("  (a high number => the date filter WORKS; ~0 => the API ignored the dates)")
+    for pid, rpa, r30pa in sample:
+        print(f"  sample {pid}: season-R PA={rpa}  L30-R PA={r30pa}")
 
 
 if __name__ == "__main__":
