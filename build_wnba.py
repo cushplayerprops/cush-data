@@ -372,6 +372,7 @@ def main():
             mn = num(r.get("MIN"))
             fga = num(r.get("FGA")); fg3a = num(r.get("FG3A")); ftm = num(r.get("FTM")); fta = num(r.get("FTA")); pts = num(r.get("PTS"))
             reb = num(r.get("REB")); ast = num(r.get("AST"))
+            oreb = num(r.get("OREB")); dreb = num(r.get("DREB"))
             stl = num(r.get("STL")); blk = num(r.get("BLK")); tov = num(r.get("TOV"))
             tmp.setdefault(pid, []).append({
                 "d": r.get("GAME_DATE"),
@@ -382,7 +383,7 @@ def main():
                 "pts": pts,
                 "ftm": ftm,
                 "fta": num(r.get("FTA")),
-                "reb": reb, "ast": ast, "stl": stl, "blk": blk, "tov": tov,
+                "reb": reb, "oreb": oreb, "dreb": dreb, "ast": ast, "stl": stl, "blk": blk, "tov": tov,
             })
             # defense-vs-position: attribute this opposing line to the defense (the opponent)
             pos = (players.get(pid) or {}).get("pos")
@@ -393,7 +394,7 @@ def main():
                     opp = mu.split(sep)[-1].strip()
                     break
             if pos and opp and (mn or 0) >= 1:
-                d = dvp_acc.setdefault(opp, {}).setdefault(pos, {"gp": 0, "fga": 0.0, "fg3a": 0.0, "twopa": 0.0, "ftm": 0.0, "fta": 0.0, "fs": 0.0, "pts": 0.0, "reb": 0.0, "ast": 0.0, "stl": 0.0, "blk": 0.0, "tov": 0.0})
+                d = dvp_acc.setdefault(opp, {}).setdefault(pos, {"gp": 0, "fga": 0.0, "fg3a": 0.0, "twopa": 0.0, "ftm": 0.0, "fta": 0.0, "fs": 0.0, "pts": 0.0, "reb": 0.0, "oreb": 0.0, "dreb": 0.0, "ast": 0.0, "stl": 0.0, "blk": 0.0, "tov": 0.0})
                 d["gp"] += 1
                 d["fga"] += (fga or 0)
                 d["fg3a"] += (fg3a or 0)
@@ -403,6 +404,8 @@ def main():
                 d["fs"] += _fs(pts, reb, ast, stl, blk, tov)
                 d["pts"] += (pts or 0)
                 d["reb"] += (reb or 0)
+                d["oreb"] += (oreb or 0)
+                d["dreb"] += (dreb or 0)
                 d["ast"] += (ast or 0)
                 d["stl"] += (stl or 0)
                 d["blk"] += (blk or 0)
@@ -492,6 +495,8 @@ def main():
                 "fs": round(d["fs"] / gp, 2),
                 "pts": round(d["pts"] / gp, 2),
                 "reb": round(d["reb"] / gp, 2),
+                "oreb": round(d["oreb"] / gp, 2),
+                "dreb": round(d["dreb"] / gp, 2),
                 "ast": round(d["ast"] / gp, 2),
                 "stl": round(d["stl"] / gp, 2),
                 "blk": round(d["blk"] / gp, 2),
