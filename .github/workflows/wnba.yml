@@ -3,7 +3,9 @@ name: Build wnba_stats
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 12,16,20,23 * * *"
+    # GitHub cron is best-effort and drops on-the-hour (:00) jobs under load, so run
+    # more often and at an odd minute for far better odds one fires on time.
+    - cron: "17 11,13,15,17,19,21,23 * * *"
 
 permissions:
   contents: write
