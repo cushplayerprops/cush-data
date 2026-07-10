@@ -247,21 +247,50 @@ def main():
     errors = {}
     game_date = os.environ.get("WNBA_DATE", et_date())
 
+    # WNBA has few games per night, and PrizePicks/Underdog post lines a couple days out.
+    # Pull today + the next couple days so the board isn't empty and future-day props show.
+    def _date_list():
+        import zoneinfo
+        forced = os.environ.get("WNBA_DATE")
+        days = int(os.environ.get("WNBA_DAYS", "3"))
+        base = datetime.datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+        if forced:
+            try:
+                base = datetime.datetime.strptime(forced, "%m/%d/%Y")
+            except Exception:
+                pass
+            return [(base.strftime("%m/%d/%Y"), base.strftime("%a"))]
+        return [((base + datetime.timedelta(days=o)).strftime("%m/%d/%Y"),
+                 (base + datetime.timedelta(days=o)).strftime("%a")) for o in range(max(1, days))]
+
     games, team_abbr = [], {}
-    try:
-        sb = get("/scoreboardv2", {"DayOffset": "0", "GameDate": game_date, "LeagueID": LEAGUE})
-        for r in rows(sb, "LineScore"):
-            if r.get("TEAM_ID") is not None:
-                team_abbr[r["TEAM_ID"]] = r.get("TEAM_ABBREVIATION")
-        for g in rows(sb, "GameHeader"):
-            games.append({
-                "gameId": g.get("GAME_ID"), "status": g.get("GAME_STATUS_ID"),
-                "statusText": (g.get("GAME_STATUS_TEXT") or "").strip(),
-                "home": {"id": g.get("HOME_TEAM_ID"), "abbr": team_abbr.get(g.get("HOME_TEAM_ID"))},
-                "away": {"id": g.get("VISITOR_TEAM_ID"), "abbr": team_abbr.get(g.get("VISITOR_TEAM_ID"))},
-            })
-    except Exception as e:
-        errors["schedule"] = str(e)
+    seen_games = set()
+    for (gd, dow) in _date_list():
+        try:
+            sb = get("/scoreboardv2", {"DayOffset": "0", "GameDate": gd, "LeagueID": LEAGUE})
+            for r in rows(sb, "LineScore"):
+                if r.get("TEAM_ID") is not None:
+                    team_abbr[r["TEAM_ID"]] = r.get("TEAM_ABBREVIATION")
+            for g in rows(sb, "GameHeader"):
+                gid = g.get("GAME_ID")
+                if gid in seen_games:
+                    continue
+                seen_games.add(gid)
+                games.append({
+                    "gameId": gid, "status": g.get("GAME_STATUS_ID"),
+                    "statusText": (g.get("GAME_STATUS_TEXT") or "").strip(),
+                    "date": gd, "day": dow,
+                    "home": {"id": g.get("HOME_TEAM_ID"), "abbr": team_abbr.get(g.get("HOME_TEAM_ID"))},
+                    "away": {"id": g.get("VISITOR_TEAM_ID"), "abbr": team_abbr.get(g.get("VISITOR_TEAM_ID"))},
+                })
+        except Exception as e:
+            errors.setdefault("schedule", str(e))
+    # backfill any abbreviations that were missing when a future-date game was first seen
+    for g in games:
+        if g["home"]["abbr"] is None:
+            g["home"]["abbr"] = team_abbr.get(g["home"]["id"])
+        if g["away"]["abbr"] is None:
+            g["away"]["abbr"] = team_abbr.get(g["away"]["id"])
 
     players = {}
 
