@@ -8,6 +8,12 @@ on:
 permissions:
   contents: write
 
+# Only ever run one feed build at a time. A second trigger (schedule + manual, or two manual
+# clicks) queues instead of running in parallel, so two runs can't collide on the git push.
+concurrency:
+  group: cush-feeds
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,6 +39,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "update cush feeds" || echo "no changes"
-          git pull --rebase --autostash origin main || true
-          git push
+          git commit -m "update cush feeds" || { echo "no changes"; exit 0; }
+          # Resilient push: if the remote moved on, merge it in but KEEP our freshly-built feed
+          # files (-s ours), then push. Retry a few times so a transient race never hard-fails.
+          for i in 1 2 3 4 5; do
+            git fetch origin main || true
+            git merge -s ours origin/main -m "merge remote main (keep fresh feeds)" || true
+            if git push origin HEAD:main; then echo "pushed on attempt $i"; exit 0; fi
+            echo "push attempt $i failed; retrying..."; sleep $((5 * i))
+          done
+          echo "push still failing after retries"; exit 1
