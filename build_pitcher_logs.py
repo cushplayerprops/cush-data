@@ -90,7 +90,7 @@ def main():
             h = num(st.get("hits")); bb = num(st.get("baseOnBalls")); hbp = num(st.get("hitByPitch"))
             w = num(st.get("wins"))
             fs = outs * 0.75 + k * 2 + w * 4 - er * 2 - (h + bb + hbp) * 0.6
-            rec.append({"k": k, "outs": outs, "er": er, "fs": round(fs, 1)})
+            rec.append({"k": k, "outs": outs, "er": er, "hits": int(h), "fs": round(fs, 1)})
         if rec:
             out[str(pid)] = rec[:KEEP]
         if n % 50 == 0:
