@@ -20,6 +20,7 @@ jobs:
         run: |
           python build_bullpen.py || echo "bullpen failed"
           python build_team_k_recent.py || echo "team_k failed"
+          python build_team_offense_recent.py || echo "team_offense failed"
           python build_hitter_ewma.py || echo "hitter_ewma failed"
           python build_pitcher_ewma.py || echo "pitcher_ewma failed"
           python build_hand_splits.py || echo "hand_splits failed"
