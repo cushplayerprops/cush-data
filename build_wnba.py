@@ -314,6 +314,7 @@ def main():
             p[prefix + "stl"] = num(r.get("STL"))
             p[prefix + "blk"] = num(r.get("BLK"))
             p[prefix + "tov"] = num(r.get("TOV"))
+            p[prefix + "pf"] = num(r.get("PF"))       # personal fouls per game -> foul-trouble flag
 
     try:
         ingest(get("/leaguedashplayerstats", dash({"LastNGames": "0"})), "")
@@ -483,6 +484,22 @@ def main():
                 t["oppAstRate"] = None
     except Exception as e:
         errors["teamOpp"] = str(e)
+
+    # Team OFFENSE free-throw volume -> how much this team DRAWS fouls (attacks the rim). A player who guards a
+    # high-FTA-drawing opponent is at more foul-trouble risk. Stored as a rate (FTA per FGA) + raw per-game FTA.
+    try:
+        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Base"}))):
+            tid = r.get("TEAM_ID")
+            t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
+            _fta, _fga = num(r.get("FTA")), num(r.get("FGA"))
+            t["ftaOff"] = _fta
+            t["fgaOff"] = _fga
+            try:
+                t["ftaRate"] = round(float(_fta) / float(_fga), 3) if (_fta not in (None, "") and _fga not in (None, "", 0)) else None
+            except Exception:
+                t["ftaRate"] = None
+    except Exception as e:
+        errors["teamBase"] = str(e)
 
     def ingest_team_zones(js):
         for r in shot_zone_rows(js):
