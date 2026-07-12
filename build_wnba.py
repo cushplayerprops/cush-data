@@ -358,6 +358,35 @@ def main():
     except Exception as e:
         errors["scoring"] = str(e)
 
+    # Catch-&-Shoot vs Pull-Up shot distribution (player tracking) -> powers the C&S / PULL funnels.
+    def ptparams(measure):
+        return {
+            "College": "", "Conference": "", "Country": "", "DateFrom": "", "DateTo": "",
+            "Division": "", "DraftPick": "", "DraftYear": "", "GameScope": "", "Height": "",
+            "LastNGames": "0", "LeagueID": LEAGUE, "Location": "", "Month": "0",
+            "OpponentTeamID": "0", "Outcome": "", "PORound": "0", "PerMode": "PerGame",
+            "PlayerExperience": "", "PlayerOrTeam": "Player", "PlayerPosition": "",
+            "PtMeasureType": measure, "Season": SEASON, "SeasonSegment": "",
+            "SeasonType": "Regular Season", "StarterBench": "", "TeamID": "0",
+            "VsConference": "", "VsDivision": "", "Weight": "",
+        }
+
+    def ingest_pt(js, fld, key):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            players[pid][key] = num(r.get(fld))
+
+    try:
+        ingest_pt(get("/leaguedashptstats", ptparams("CatchShoot")), "CATCH_SHOOT_FGA", "csFga")
+    except Exception as e:
+        errors["catchShoot"] = str(e)
+    try:
+        ingest_pt(get("/leaguedashptstats", ptparams("PullUpShot")), "PULL_UP_FGA", "puFga")
+    except Exception as e:
+        errors["pullUp"] = str(e)
+
     # Player positions (single call) -> G/F/C bucket. Needed for defense-vs-position aggregation.
     def pos_bucket(s):
         head = (s or "").upper().strip().split("-")[0].strip()
