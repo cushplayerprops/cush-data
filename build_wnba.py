@@ -314,7 +314,6 @@ def main():
             p[prefix + "stl"] = num(r.get("STL"))
             p[prefix + "blk"] = num(r.get("BLK"))
             p[prefix + "tov"] = num(r.get("TOV"))
-            p[prefix + "pf"] = num(r.get("PF"))       # personal fouls per game -> foul-trouble flag
 
     try:
         ingest(get("/leaguedashplayerstats", dash({"LastNGames": "0"})), "")
@@ -370,6 +369,7 @@ def main():
             return "C"
         return None
 
+    roster_ids = set()
     try:
         pidx = get("/playerindex", {
             "College": "", "Country": "", "DraftPick": "", "DraftRound": "", "DraftYear": "",
@@ -379,6 +379,9 @@ def main():
         for r in rows(pidx):
             pid = r.get("PERSON_ID")
             b = pos_bucket(r.get("POSITION"))
+            _tid = r.get("TEAM_ID")
+            if pid is not None and _tid:
+                roster_ids.add(pid)
             if pid in players and b:
                 players[pid]["pos"] = b
     except Exception as e:
@@ -395,6 +398,7 @@ def main():
     # PerMode=Totals gives each game's actual raw stat line.
     def ingest_logs(js):
         tmp = {}
+        dvp_rows = []  # (opp, pos, date, stats) -> filtered to each defense's last 10 games
         for r in rows(js):
             pid = r.get("PLAYER_ID")
             if pid is None:
@@ -415,7 +419,8 @@ def main():
                 "fta": num(r.get("FTA")),
                 "reb": reb, "oreb": oreb, "dreb": dreb, "ast": ast, "stl": stl, "blk": blk, "tov": tov,
             })
-            # defense-vs-position: attribute this opposing line to the defense (the opponent)
+            # defense-vs-position: attribute this opposing line to the defense (the opponent).
+            # collected first, then restricted to each defense's last 10 games below.
             pos = (players.get(pid) or {}).get("pos")
             mu = r.get("MATCHUP") or ""
             opp = None
@@ -424,22 +429,34 @@ def main():
                     opp = mu.split(sep)[-1].strip()
                     break
             if pos and opp and (mn or 0) >= 1:
-                d = dvp_acc.setdefault(opp, {}).setdefault(pos, {"gp": 0, "fga": 0.0, "fg3a": 0.0, "twopa": 0.0, "ftm": 0.0, "fta": 0.0, "fs": 0.0, "pts": 0.0, "reb": 0.0, "oreb": 0.0, "dreb": 0.0, "ast": 0.0, "stl": 0.0, "blk": 0.0, "tov": 0.0})
-                d["gp"] += 1
-                d["fga"] += (fga or 0)
-                d["fg3a"] += (fg3a or 0)
-                d["twopa"] += ((fga or 0) - (fg3a or 0))
-                d["ftm"] += (ftm or 0)
-                d["fta"] += (fta or 0)
-                d["fs"] += _fs(pts, reb, ast, stl, blk, tov)
-                d["pts"] += (pts or 0)
-                d["reb"] += (reb or 0)
-                d["oreb"] += (oreb or 0)
-                d["dreb"] += (dreb or 0)
-                d["ast"] += (ast or 0)
-                d["stl"] += (stl or 0)
-                d["blk"] += (blk or 0)
-                d["tov"] += (tov or 0)
+                dvp_rows.append((opp, pos, r.get("GAME_DATE"), {
+                    "fga": fga, "fg3a": fg3a, "ftm": ftm, "fta": fta, "pts": pts,
+                    "reb": reb, "oreb": oreb, "dreb": dreb, "ast": ast, "stl": stl, "blk": blk, "tov": tov,
+                }))
+        # OPPONENT STATS OVER THE LAST 10 GAMES: keep only each defense's 10 most-recent game dates
+        opp_dates = {}
+        for (_opp, _pos, _dt, _st) in dvp_rows:
+            opp_dates.setdefault(_opp, set()).add(_dt or "")
+        opp_keep = {_opp: set(sorted(_ds, reverse=True)[:10]) for _opp, _ds in opp_dates.items()}
+        for (_opp, _pos, _dt, _st) in dvp_rows:
+            if (_dt or "") not in opp_keep.get(_opp, set()):
+                continue
+            d = dvp_acc.setdefault(_opp, {}).setdefault(_pos, {"gp": 0, "fga": 0.0, "fg3a": 0.0, "twopa": 0.0, "ftm": 0.0, "fta": 0.0, "fs": 0.0, "pts": 0.0, "reb": 0.0, "oreb": 0.0, "dreb": 0.0, "ast": 0.0, "stl": 0.0, "blk": 0.0, "tov": 0.0})
+            d["gp"] += 1
+            d["fga"] += (_st["fga"] or 0)
+            d["fg3a"] += (_st["fg3a"] or 0)
+            d["twopa"] += ((_st["fga"] or 0) - (_st["fg3a"] or 0))
+            d["ftm"] += (_st["ftm"] or 0)
+            d["fta"] += (_st["fta"] or 0)
+            d["fs"] += _fs(_st["pts"], _st["reb"], _st["ast"], _st["stl"], _st["blk"], _st["tov"])
+            d["pts"] += (_st["pts"] or 0)
+            d["reb"] += (_st["reb"] or 0)
+            d["oreb"] += (_st["oreb"] or 0)
+            d["dreb"] += (_st["dreb"] or 0)
+            d["ast"] += (_st["ast"] or 0)
+            d["stl"] += (_st["stl"] or 0)
+            d["blk"] += (_st["blk"] or 0)
+            d["tov"] += (_st["tov"] or 0)
         for pid, gl in tmp.items():
             gl.sort(key=lambda g: (g.get("d") or ""), reverse=True)
             recent = gl[:12]
@@ -460,7 +477,7 @@ def main():
 
     teams = {}
     try:
-        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Advanced"}))):
+        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Advanced", "LastNGames": "10"}))):
             tid = r.get("TEAM_ID")
             teams[tid] = {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION"),
                 "pace": num(r.get("PACE")), "gp": num(r.get("GP"))}
@@ -468,7 +485,7 @@ def main():
         errors["teamPace"] = str(e)
 
     try:
-        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent"}))):
+        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent", "LastNGames": "10"}))):
             tid = r.get("TEAM_ID")
             t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
             t["oppFga"] = num(r.get("OPP_FGA"))
@@ -485,22 +502,6 @@ def main():
     except Exception as e:
         errors["teamOpp"] = str(e)
 
-    # Team OFFENSE free-throw volume -> how much this team DRAWS fouls (attacks the rim). A player who guards a
-    # high-FTA-drawing opponent is at more foul-trouble risk. Stored as a rate (FTA per FGA) + raw per-game FTA.
-    try:
-        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Base"}))):
-            tid = r.get("TEAM_ID")
-            t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
-            _fta, _fga = num(r.get("FTA")), num(r.get("FGA"))
-            t["ftaOff"] = _fta
-            t["fgaOff"] = _fga
-            try:
-                t["ftaRate"] = round(float(_fta) / float(_fga), 3) if (_fta not in (None, "") and _fga not in (None, "", 0)) else None
-            except Exception:
-                t["ftaRate"] = None
-    except Exception as e:
-        errors["teamBase"] = str(e)
-
     def ingest_team_zones(js):
         for r in shot_zone_rows(js):
             tid = r.get("TEAM_ID")
@@ -516,7 +517,7 @@ def main():
             t["dz_above3"] = gg("Above the Break 3")
 
     try:
-        ingest_team_zones(get("/leaguedashteamshotlocations", dash({"MeasureType": "Opponent", "DistanceRange": "By Zone"})))
+        ingest_team_zones(get("/leaguedashteamshotlocations", dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "LastNGames": "10"})))
     except Exception as e:
         errors["teamZoneDef"] = str(e)
 
@@ -568,6 +569,17 @@ def main():
                 if _st.get("detail"):
                     _pl["injDetail"] = _st["detail"]
                 inj_matched += 1
+
+    # PLAYER CHIPS = SEASON RATES, qualifier >=5 GP and >=16 MPG, current rosters only.
+    MIN_GP, MIN_MPG = 5, 16
+    _kept = {}
+    for _pid, _p in players.items():
+        if (_p.get("gp") or 0) < MIN_GP or (_p.get("min") or 0) < MIN_MPG:
+            continue
+        if roster_ids and _pid not in roster_ids:
+            continue
+        _kept[_pid] = _p
+    players = _kept
 
     out = {
         "updated": datetime.datetime.utcnow().isoformat() + "Z",
