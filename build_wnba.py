@@ -554,18 +554,31 @@ def main():
         errors["teamBase"] = str(e)
 
     def ingest_team_zones(js):
+        def _pct(fgm, fga):
+            try:
+                return round(float(fgm) / float(fga), 3) if (fgm not in (None, "") and fga not in (None, "", 0)) else None
+            except Exception:
+                return None
         for r in shot_zone_rows(js):
             tid = r.get("TEAM_ID")
             if tid is None:
                 continue
             t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid)})
             gg = lambda z: num(r.get(z + "|FGA"))
+            gm = lambda z: num(r.get(z + "|FGM"))
             lc, rc = gg("Left Corner 3"), gg("Right Corner 3")
+            lcm, rcm = gm("Left Corner 3"), gm("Right Corner 3")
             t["dz_ra"] = gg("Restricted Area")
             t["dz_paint"] = gg("In The Paint (Non-RA)")
             t["dz_mid"] = gg("Mid-Range")
             t["dz_corner3"] = round((lc or 0) + (rc or 0), 3)
             t["dz_above3"] = gg("Above the Break 3")
+            # opponent FG% ALLOWED per zone (efficiency / "how easy the bucket is") -> powers efficiency-true Shredder/Lob
+            t["dz_ra_pct"] = _pct(gm("Restricted Area"), gg("Restricted Area"))
+            t["dz_paint_pct"] = _pct(gm("In The Paint (Non-RA)"), gg("In The Paint (Non-RA)"))
+            t["dz_mid_pct"] = _pct(gm("Mid-Range"), gg("Mid-Range"))
+            t["dz_corner3_pct"] = _pct((lcm or 0) + (rcm or 0), (lc or 0) + (rc or 0))
+            t["dz_above3_pct"] = _pct(gm("Above the Break 3"), gg("Above the Break 3"))
 
     try:
         ingest_team_zones(get("/leaguedashteamshotlocations", dash({"MeasureType": "Opponent", "DistanceRange": "By Zone"})))
