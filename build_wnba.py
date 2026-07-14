@@ -615,3 +615,96 @@ def main():
                 "fg3a": round(d["fg3a"] / gp, 2),
                 "twopa": round(d["twopa"] / gp, 2),
                 "ftm": round(d["ftm"] / gp, 2),
+                "fta": round(d["fta"] / gp, 2),
+                "fs": round(d["fs"] / gp, 2),
+                "pts": round(d["pts"] / gp, 2),
+                "reb": round(d["reb"] / gp, 2),
+                "oreb": round(d["oreb"] / gp, 2),
+                "dreb": round(d["dreb"] / gp, 2),
+                "ast": round(d["ast"] / gp, 2),
+                "stl": round(d["stl"] / gp, 2),
+                "blk": round(d["blk"] / gp, 2),
+                "tov": round(d["tov"] / gp, 2),
+            }
+        if dvp:
+            teams[tid]["dvp"] = dvp
+
+    # Synergy play types -> player OFFENSE (P&R ball handler / roll man) + team DEFENSE (PPP allowed).
+    # WNBA synergy coverage is uncertain, so this is fully guarded and self-diagnosing: the
+    # errors["synergy_diag"] counts tell us on the first run whether the WNBA exposes this feed.
+    def synparams(playtype, grouping, port):
+        return {
+            "LeagueID": LEAGUE, "PerMode": "PerGame", "PlayType": playtype,
+            "PlayerOrTeam": port, "SeasonType": "Regular Season",
+            "SeasonYear": SEASON, "TypeGrouping": grouping,
+        }
+
+    def ingest_syn_off(js, pfx):
+        n = 0
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            players[pid][pfx + "Ppp"] = num(r.get("PPP"))       # points per possession
+            players[pid][pfx + "Freq"] = num(r.get("POSS_PCT"))  # how often the player runs this action
+            players[pid][pfx + "Pct"] = num(r.get("PERCENTILE"))
+            n += 1
+        return n
+
+    def ingest_syn_def(js, pfx):
+        n = 0
+        for r in rows(js):
+            tid = r.get("TEAM_ID")
+            if tid is None or tid not in teams:
+                continue
+            teams[tid][pfx + "Ppp"] = num(r.get("PPP"))          # points per possession ALLOWED
+            teams[tid][pfx + "Pct"] = num(r.get("PERCENTILE"))
+            n += 1
+        return n
+
+    try:
+        _snO1 = ingest_syn_off(get("/synergyplaytypes", synparams("PRBallHandler", "offensive", "P")), "prbh")
+        _snO2 = ingest_syn_off(get("/synergyplaytypes", synparams("PRRollMan", "offensive", "P")), "prrm")
+        _snD1 = ingest_syn_def(get("/synergyplaytypes", synparams("PRBallHandler", "defensive", "T")), "prbhDef")
+        _snD2 = ingest_syn_def(get("/synergyplaytypes", synparams("PRRollMan", "defensive", "T")), "prrmDef")
+        errors["synergy_diag"] = "prbhOff=%d prrmOff=%d prbhDef=%d prrmDef=%d" % (_snO1, _snO2, _snD1, _snD2)
+    except Exception as e:
+        errors["synergy"] = str(e)
+
+    # Real player availability from ESPN (Out / Doubtful / Questionable / Day-To-Day).
+    inj_map, inj_matched = {}, 0
+    try:
+        inj_map = parse_injuries(fetch_injuries_raw())
+    except Exception as e:
+        errors["injuries"] = str(e)
+    if inj_map:
+        for _pl in players.values():
+            _nm = _pl.get("name")
+            if not _nm:
+                continue
+            _st = inj_map.get(pbnorm(_nm))
+            if _st:
+                _pl["injStatus"] = _st["status"]
+                if _st.get("detail"):
+                    _pl["injDetail"] = _st["detail"]
+                inj_matched += 1
+
+    out = {
+        "updated": datetime.datetime.utcnow().isoformat() + "Z",
+        "season": SEASON, "gameDate": game_date,
+        "counts": {"games": len(games), "players": len(players), "teams": len(teams), "injListed": len(inj_map), "injMatched": inj_matched, "posMatched": sum(1 for p in players.values() if p.get("pos")), "dvpTeams": sum(1 for t in teams.values() if t.get("dvp"))},
+        "games": games, "teams": teams, "players": players,
+    }
+    if errors:
+        out["errors"] = errors
+
+    with open(OUT, "w") as f:
+        json.dump(out, f, separators=(",", ":"))
+
+    print("WROTE", OUT, out["counts"], ("ERRORS: " + json.dumps(errors)) if errors else "")
+    if not players and not games:
+        raise SystemExit("no data fetched -- stats.wnba.com likely blocked this runner")
+
+
+if __name__ == "__main__":
+    main()
