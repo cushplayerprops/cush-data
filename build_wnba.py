@@ -531,6 +531,73 @@ def main():
         if p.get("teamId") is not None and p.get("teamAbbr"):
             id2abbr[p["teamId"]] = p["teamAbbr"]
 
+    # ---- ESPN scoreboard fallback: stats.wnba.com occasionally drops a game for a date;
+    # cross-check ESPN's schedule and add any game the stats feed missed so the slate is complete. ----
+    try:
+        _ESPN_SB = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
+        _ESPN2WNBA = {"CONN": "CON", "GS": "GSV", "GSW": "GSV", "LA": "LAS", "LV": "LVA",
+                      "NY": "NYL", "PHO": "PHX", "WSH": "WAS", "POR": "PDX"}
+        _abbr2id = {}
+        for _tid, _ab in id2abbr.items():
+            if _ab:
+                _abbr2id[_ab] = _tid
+        _have = set()
+        for _g in games:
+            _have.add((_g["date"], _g["home"]["id"], _g["away"]["id"]))
+            _have.add((_g["date"], _g["away"]["id"], _g["home"]["id"]))
+
+        def _espn_sb(ymd):
+            _u = _ESPN_SB + "?dates=" + ymd + "&limit=50"
+            try:
+                _r = requests.get(_u, headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"}, timeout=30)
+                _r.raise_for_status()
+                return _r.json()
+            except Exception:
+                try:
+                    return get_url(_u)
+                except Exception:
+                    return {}
+
+        def _abbr_of(c):
+            a = ((c.get("team") or {}).get("abbreviation") or "").upper()
+            return _ESPN2WNBA.get(a, a)
+
+        _added, _unmapped = 0, []
+        for (_gd, _dow) in _date_list():
+            _mm, _dd, _yy = _gd.split("/")
+            _js = _espn_sb(_yy + _mm + _dd)
+            for _ev in (_js.get("events") or []):
+                _comp = (_ev.get("competitions") or [{}])[0]
+                _cs = _comp.get("competitors") or []
+                _home = next((c for c in _cs if c.get("homeAway") == "home"), None)
+                _away = next((c for c in _cs if c.get("homeAway") == "away"), None)
+                if not _home or not _away:
+                    continue
+                _ha, _aa = _abbr_of(_home), _abbr_of(_away)
+                _hid, _aid = _abbr2id.get(_ha), _abbr2id.get(_aa)
+                if _hid is None or _aid is None:
+                    _unmapped.append(_ha + "@" + _aa)
+                    continue
+                if (_gd, _hid, _aid) in _have or (_gd, _aid, _hid) in _have:
+                    continue
+                _st = ((_comp.get("status") or {}).get("type") or {})
+                games.append({
+                    "gameId": "espn_" + str(_ev.get("id")), "status": None,
+                    "statusText": (_st.get("shortDetail") or _st.get("detail") or "").strip(),
+                    "date": _gd, "day": _dow,
+                    "home": {"id": _hid, "abbr": _ha},
+                    "away": {"id": _aid, "abbr": _aa},
+                })
+                _have.add((_gd, _hid, _aid))
+                _have.add((_gd, _aid, _hid))
+                _added += 1
+        if _added:
+            errors["espn_sched_added"] = str(_added)
+        if _unmapped:
+            errors["espn_sched_unmapped"] = ",".join(sorted(set(_unmapped)))[:120]
+    except Exception as _e:
+        errors["espn_sched"] = str(_e)
+
     teams = {}
     try:
         for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Advanced"}))):
