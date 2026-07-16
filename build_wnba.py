@@ -451,6 +451,8 @@ def main():
 
     # defense-vs-position accumulator: opp_abbr -> pos -> running totals (filled during ingest_logs)
     dvp_acc = {}
+    # raw per-line capture (opp_abbr, pos, game_date, statline) so we can build an L10 DVP below
+    dvp_raw = []
 
     def _fs(pts, reb, ast, stl, blk, tov):
         # PrizePicks WNBA fantasy score
@@ -505,6 +507,12 @@ def main():
                 d["stl"] += (stl or 0)
                 d["blk"] += (blk or 0)
                 d["tov"] += (tov or 0)
+                dvp_raw.append((opp, pos, r.get("GAME_DATE"), {
+                    "fga": (fga or 0), "fg3a": (fg3a or 0), "twopa": ((fga or 0) - (fg3a or 0)),
+                    "ftm": (ftm or 0), "fta": (fta or 0), "fs": _fs(pts, reb, ast, stl, blk, tov),
+                    "pts": (pts or 0), "reb": (reb or 0), "oreb": (oreb or 0), "dreb": (dreb or 0),
+                    "ast": (ast or 0), "stl": (stl or 0), "blk": (blk or 0), "tov": (tov or 0),
+                }))
         for pid, gl in tmp.items():
             gl.sort(key=lambda g: (g.get("d") or ""), reverse=True)
             recent = gl[:12]
@@ -628,6 +636,163 @@ def main():
             }
         if dvp:
             teams[tid]["dvp"] = dvp
+
+    # ===================== LAST-10-GAMES (L10) SCORING INPUTS =====================
+    # Every input the dashboard's Cush score engine consumes, re-pulled over the last
+    # 10 games and stored in a nested "l10" block on each player/team. Season fields
+    # above are left untouched; the front-end overlays this block when L10 is selected.
+    def _pct10(a, b):
+        try:
+            return round(float(a) / float(b), 3) if (a not in (None, "") and b not in (None, "", 0)) else None
+        except Exception:
+            return None
+
+    # --- players: L10 base stats (remap the already-fetched r_* last-10 averages) ---
+    _BASEMAP = {"gp": "r_gp", "min": "r_min", "fga": "r_fga", "fg3a": "r_fg3a", "pts": "r_pts",
+                "ftm": "r_ftm", "fta": "r_fta", "ftPct": "r_ftPct", "reb": "r_reb", "ast": "r_ast",
+                "stl": "r_stl", "blk": "r_blk", "tov": "r_tov", "pf": "r_pf"}
+    for _p in players.values():
+        _d = _p.setdefault("l10", {})
+        for _k, _rk in _BASEMAP.items():
+            if _p.get(_rk) is not None:
+                _d[_k] = _p.get(_rk)
+
+    # --- players: L10 shot zones (attempts + FG% by zone) ---
+    def ingest_zones_l10(js):
+        for r in shot_zone_rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            d = players[pid].setdefault("l10", {})
+            g = lambda z: num(r.get(z + "|FGA"))
+            gm = lambda z: num(r.get(z + "|FGM"))
+            lc, rc = g("Left Corner 3"), g("Right Corner 3")
+            lcm, rcm = gm("Left Corner 3"), gm("Right Corner 3")
+            d["z_ra"] = g("Restricted Area")
+            d["z_paint"] = g("In The Paint (Non-RA)")
+            d["z_mid"] = g("Mid-Range")
+            d["z_corner3"] = round((lc or 0) + (rc or 0), 3)
+            d["z_above3"] = g("Above the Break 3")
+            d["z_ra_pct"] = _pct10(gm("Restricted Area"), g("Restricted Area"))
+            d["z_paint_pct"] = _pct10(gm("In The Paint (Non-RA)"), g("In The Paint (Non-RA)"))
+            d["z_mid_pct"] = _pct10(gm("Mid-Range"), g("Mid-Range"))
+            d["z_corner3_pct"] = _pct10((lcm or 0) + (rcm or 0), (lc or 0) + (rc or 0))
+            d["z_above3_pct"] = _pct10(gm("Above the Break 3"), g("Above the Break 3"))
+
+    try:
+        ingest_zones_l10(get("/leaguedashplayershotlocations", dash({"DistanceRange": "By Zone", "LastNGames": "10"})))
+    except Exception as e:
+        errors["shotZones_l10"] = str(e)
+
+    # --- players: L10 assisted% (catch&shoot proxy) ---
+    def ingest_scoring_l10(js):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            d = players[pid].setdefault("l10", {})
+            d["ast3Pct"] = num(r.get("PCT_AST_3PM"))
+            d["ast2Pct"] = num(r.get("PCT_AST_2PM"))
+            d["astFgPct"] = num(r.get("PCT_AST_FGM"))
+
+    try:
+        ingest_scoring_l10(get("/leaguedashplayerstats", dash({"MeasureType": "Scoring", "LastNGames": "10"})))
+    except Exception as e:
+        errors["scoring_l10"] = str(e)
+
+    # --- teams: L10 pace / opponent / base / zone-defense ---
+    try:
+        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Advanced", "LastNGames": "10"}))):
+            tid = r.get("TEAM_ID")
+            if tid in teams:
+                teams[tid].setdefault("l10", {})["pace"] = num(r.get("PACE"))
+    except Exception as e:
+        errors["teamPace_l10"] = str(e)
+    try:
+        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent", "LastNGames": "10"}))):
+            tid = r.get("TEAM_ID")
+            if tid not in teams:
+                continue
+            d = teams[tid].setdefault("l10", {})
+            d["oppFga"] = num(r.get("OPP_FGA"))
+            d["oppFg3a"] = num(r.get("OPP_FG3A"))
+            d["oppFg3Pct"] = num(r.get("OPP_FG3_PCT"))
+            d["oppFta"] = num(r.get("OPP_FTA"))
+            d["oppAstRate"] = _pct10(r.get("OPP_AST"), r.get("OPP_FGM"))
+    except Exception as e:
+        errors["teamOpp_l10"] = str(e)
+    try:
+        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Base", "LastNGames": "10"}))):
+            tid = r.get("TEAM_ID")
+            if tid not in teams:
+                continue
+            d = teams[tid].setdefault("l10", {})
+            _fta, _fga = num(r.get("FTA")), num(r.get("FGA"))
+            d["ftaOff"] = _fta
+            d["fgaOff"] = _fga
+            d["ftaRate"] = _pct10(_fta, _fga)
+    except Exception as e:
+        errors["teamBase_l10"] = str(e)
+
+    def ingest_team_zones_l10(js):
+        for r in shot_zone_rows(js):
+            tid = r.get("TEAM_ID")
+            if tid is None or tid not in teams:
+                continue
+            d = teams[tid].setdefault("l10", {})
+            gg = lambda z: num(r.get(z + "|FGA"))
+            gm = lambda z: num(r.get(z + "|FGM"))
+            lc, rc = gg("Left Corner 3"), gg("Right Corner 3")
+            lcm, rcm = gm("Left Corner 3"), gm("Right Corner 3")
+            d["dz_ra"] = gg("Restricted Area")
+            d["dz_paint"] = gg("In The Paint (Non-RA)")
+            d["dz_mid"] = gg("Mid-Range")
+            d["dz_corner3"] = round((lc or 0) + (rc or 0), 3)
+            d["dz_above3"] = gg("Above the Break 3")
+            d["dz_ra_pct"] = _pct10(gm("Restricted Area"), gg("Restricted Area"))
+            d["dz_paint_pct"] = _pct10(gm("In The Paint (Non-RA)"), gg("In The Paint (Non-RA)"))
+            d["dz_mid_pct"] = _pct10(gm("Mid-Range"), gg("Mid-Range"))
+            d["dz_corner3_pct"] = _pct10((lcm or 0) + (rcm or 0), (lc or 0) + (rc or 0))
+            d["dz_above3_pct"] = _pct10(gm("Above the Break 3"), gg("Above the Break 3"))
+
+    try:
+        ingest_team_zones_l10(get("/leaguedashteamshotlocations", dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "LastNGames": "10"})))
+    except Exception as e:
+        errors["teamZoneDef_l10"] = str(e)
+
+    # --- teams: L10 defense-vs-position (only each defense's last 10 game-dates) ---
+    try:
+        by_opp_dates = {}
+        for (opp_abbr, pos, gdate, sl) in dvp_raw:
+            if opp_abbr and gdate:
+                by_opp_dates.setdefault(opp_abbr, set()).add(gdate)
+        last10 = {o: set(sorted(ds, reverse=True)[:10]) for o, ds in by_opp_dates.items()}
+        _SUMK = ("fga", "fg3a", "twopa", "ftm", "fta", "fs", "pts", "reb", "oreb", "dreb", "ast", "stl", "blk", "tov")
+        dvp_acc_l10 = {}
+        for (opp_abbr, pos, gdate, sl) in dvp_raw:
+            if not opp_abbr or gdate not in last10.get(opp_abbr, ()):
+                continue
+            d = dvp_acc_l10.setdefault(opp_abbr, {}).setdefault(pos, {"gp": 0})
+            d["gp"] += 1
+            for kk in _SUMK:
+                d[kk] = d.get(kk, 0.0) + (sl.get(kk, 0) or 0)
+        for opp_abbr, posmap in dvp_acc_l10.items():
+            tid = abbr2id.get(opp_abbr)
+            if tid is None or tid not in teams:
+                continue
+            dvp = {}
+            for pos, d in posmap.items():
+                gp = d.get("gp") or 0
+                if gp <= 0:
+                    continue
+                dvp[pos] = {"gp": gp}
+                for kk in _SUMK:
+                    dvp[pos][kk] = round(d.get(kk, 0.0) / gp, 2)
+            if dvp:
+                teams[tid].setdefault("l10", {})["dvp"] = dvp
+    except Exception as e:
+        errors["dvp_l10"] = str(e)
+    # =================== END LAST-10-GAMES (L10) INPUTS ===================
 
     # Synergy play types -> player OFFENSE (P&R ball handler / roll man) + team DEFENSE (PPP allowed).
     # WNBA synergy coverage is uncertain, so this is fully guarded and self-diagnosing: the
