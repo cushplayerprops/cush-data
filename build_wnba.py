@@ -660,7 +660,11 @@ def main():
         for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Advanced"}))):
             tid = r.get("TEAM_ID")
             teams[tid] = {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION"),
-                "pace": num(r.get("PACE")), "gp": num(r.get("GP"))}
+                "pace": num(r.get("PACE")), "gp": num(r.get("GP")),
+                # rebound-rate context: how hard this team crashes the O-glass / secures the D-glass.
+                # OREB split -> opp's weak D-glass (low opp drebPct) opens offensive boards; DREB split -> opp's
+                # O-glass crashing (high opp orebPct) steals defensive boards away.
+                "orebPct": num(r.get("OREB_PCT")), "drebPct": num(r.get("DREB_PCT")), "rebPct": num(r.get("REB_PCT"))}
     except Exception as e:
         errors["teamPace"] = str(e)
 
@@ -691,6 +695,9 @@ def main():
             _fta, _fga = num(r.get("FTA")), num(r.get("FGA"))
             t["ftaOff"] = _fta
             t["fgaOff"] = _fga
+            # FGM -> exact expected misses per game (FGA - FGM) for the rebound expected-misses driver.
+            t["fgmOff"] = num(r.get("FGM"))
+            t["fgPct"] = num(r.get("FG_PCT"))
             try:
                 t["ftaRate"] = round(float(_fta) / float(_fga), 3) if (_fta not in (None, "") and _fga not in (None, "", 0)) else None
             except Exception:
