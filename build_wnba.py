@@ -545,6 +545,10 @@ def main():
         for _g in games:
             _have.add((_g["date"], _g["home"]["id"], _g["away"]["id"]))
             _have.add((_g["date"], _g["away"]["id"], _g["home"]["id"]))
+        _gmap = {}
+        for _g in games:
+            _gmap[(_g["date"], _g["home"]["id"], _g["away"]["id"])] = _g
+        _odds_added = 0
 
         def _espn_sb(ymd):
             _u = _ESPN_SB + "?dates=" + ymd + "&limit=50"
@@ -561,6 +565,41 @@ def main():
         def _abbr_of(c):
             a = ((c.get("team") or {}).get("abbreviation") or "").upper()
             return _ESPN2WNBA.get(a, a)
+        def _espn_gameodds(_comp):
+            for _o in (_comp.get("odds") or []):
+                _ou = _o.get("overUnder")
+                if _ou is None:
+                    continue
+                try:
+                    _total = float(_ou)
+                except Exception:
+                    continue
+                _sp = _o.get("spread")
+                try:
+                    _mag = abs(float(_sp)) if _sp not in (None, "") else None
+                except Exception:
+                    _mag = None
+                _hto = _o.get("homeTeamOdds") or {}
+                _ato = _o.get("awayTeamOdds") or {}
+                _hf = bool(_hto.get("favorite"))
+                _af = bool(_ato.get("favorite"))
+                if not _hf and not _af:
+                    _hml, _aml = _hto.get("moneyLine"), _ato.get("moneyLine")
+                    try:
+                        if _hml is not None and _aml is not None:
+                            _hf = float(_hml) < float(_aml); _af = not _hf
+                    except Exception:
+                        pass
+                if not _hf and not _af and _sp not in (None, ""):
+                    try:
+                        _hf = float(_sp) < 0; _af = not _hf
+                    except Exception:
+                        pass
+                _hs = None
+                if _mag is not None:
+                    _hs = (-_mag if _hf else (_mag if _af else None))
+                return _total, _hs
+            return None, None
 
         _added, _unmapped = 0, []
         for (_gd, _dow) in _date_list():
@@ -578,21 +617,39 @@ def main():
                 if _hid is None or _aid is None:
                     _unmapped.append(_ha + "@" + _aa)
                     continue
-                if (_gd, _hid, _aid) in _have or (_gd, _aid, _hid) in _have:
+                _total, _hs = _espn_gameodds(_comp)
+                _exist = _gmap.get((_gd, _hid, _aid))
+                _existRev = _gmap.get((_gd, _aid, _hid))
+                if _exist is not None or _existRev is not None:
+                    _tg = _exist if _exist is not None else _existRev
+                    if _total is not None:
+                        _tg["total"] = _total
+                    if _hs is not None:
+                        _tg["spreadHome"] = _hs if _exist is not None else (-_hs)
+                    if _total is not None or _hs is not None:
+                        _odds_added += 1
                     continue
                 _st = ((_comp.get("status") or {}).get("type") or {})
-                games.append({
+                _ng = {
                     "gameId": "espn_" + str(_ev.get("id")), "status": None,
                     "statusText": (_st.get("shortDetail") or _st.get("detail") or "").strip(),
                     "date": _gd, "day": _dow,
                     "home": {"id": _hid, "abbr": _ha},
                     "away": {"id": _aid, "abbr": _aa},
-                })
+                }
+                if _total is not None:
+                    _ng["total"] = _total
+                if _hs is not None:
+                    _ng["spreadHome"] = _hs
+                games.append(_ng)
+                _gmap[(_gd, _hid, _aid)] = _ng
                 _have.add((_gd, _hid, _aid))
                 _have.add((_gd, _aid, _hid))
                 _added += 1
         if _added:
             errors["espn_sched_added"] = str(_added)
+        if _odds_added:
+            errors["espn_odds_added"] = str(_odds_added)
         if _unmapped:
             errors["espn_sched_unmapped"] = ",".join(sorted(set(_unmapped)))[:120]
     except Exception as _e:
