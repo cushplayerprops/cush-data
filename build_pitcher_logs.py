@@ -6,16 +6,18 @@ Per-game pitcher logs for L10 hit-rates on the Strikeout / Pitcher-FS models.
 
 Output shape (keyed by MLB player id), most-recent game first:
 {
-  "543037": [ {"k":7,"outs":18,"er":2,"fs":18.85}, ... ],
+  "543037": [ {"k":7,"outs":18,"er":2,"hits":4,"pitches":95,"fs":18.85}, ... ],
   ...
 }
 
 Per game:
-  k    = strikeouts
-  outs = outs recorded (innings pitched x 3)   -> pitcher-outs prop
-  er   = earned runs                            -> earned-runs prop
-  fs   = DraftKings-style pitcher fantasy:
-         outs*0.75 + k*2 + win*4 - er*2 - (hits+walks+HBP)*0.6
+  k       = strikeouts
+  outs    = outs recorded (innings pitched x 3)   -> pitcher-outs prop
+  er      = earned runs                            -> earned-runs prop
+  hits    = hits allowed                           -> hits prop
+  pitches = pitches thrown                          -> pitches-thrown prop
+  fs      = DraftKings-style pitcher fantasy:
+            outs*0.75 + k*2 + win*4 - er*2 - (hits+walks+HBP)*0.6
 
 Only appearances with at least one out are kept (drops did-not-pitch rows).
 No API key needed. The MLB Stats API is public.
@@ -89,8 +91,9 @@ def main():
             er = int(num(st.get("earnedRuns")))
             h = num(st.get("hits")); bb = num(st.get("baseOnBalls")); hbp = num(st.get("hitByPitch"))
             w = num(st.get("wins"))
+            pit = int(num(st.get("numberOfPitches")))
             fs = outs * 0.75 + k * 2 + w * 4 - er * 2 - (h + bb + hbp) * 0.6
-            rec.append({"k": k, "outs": outs, "er": er, "hits": int(h), "fs": round(fs, 1)})
+            rec.append({"k": k, "outs": outs, "er": er, "hits": int(h), "pitches": pit, "fs": round(fs, 1)})
         if rec:
             out[str(pid)] = rec[:KEEP]
         if n % 50 == 0:
