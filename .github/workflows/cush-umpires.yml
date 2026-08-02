@@ -1,0 +1,50 @@
+name: Refresh umpires
+
+# Light, standalone refresh for JUST the home-plate umpire feed. MLB posts each game's plate
+# ump on game-day (usually early-mid afternoon ET), which is AFTER the once-daily cush-feeds
+# build runs. So this runs a few times through the afternoon/evening to pick up today's
+# assignments and light up the UMP column, without re-pulling all the heavy feeds.
+on:
+  schedule:
+    # Times are UTC. Summer (EDT = UTC-4): 18:00->2pm, 21:00->5pm, 23:00->7pm ET.
+    - cron: '0 18 * * *'
+    - cron: '0 21 * * *'
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Share the SAME concurrency group as the main feeds build so the two workflows never push at
+# the same time (they queue instead of colliding on the git push).
+concurrency:
+  group: cush-feeds
+  cancel-in-progress: false
+
+jobs:
+  umpires:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build umpires feed
+        run: |
+          python build_umpires.py || echo "umpires failed"
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add umpires.json
+          git commit -m "refresh umpires feed" || { echo "no changes"; exit 0; }
+          # This workflow only ever touches umpires.json, so REBASE onto remote main (don't use
+          # '-s ours' like the main build) — that way it keeps every other feed the main build
+          # pushed and just replays the umpires.json change on top. Retry for transient races.
+          for i in 1 2 3 4 5; do
+            git fetch origin main || true
+            git rebase origin/main || { git rebase --abort || true; }
+            if git push origin HEAD:main; then echo "pushed on attempt $i"; exit 0; fi
+            echo "push attempt $i failed; retrying..."; sleep $((5 * i))
+          done
+          echo "push still failing after retries"; exit 1
