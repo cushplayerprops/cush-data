@@ -325,37 +325,46 @@ def main():
     except Exception as e:
         errors["playersRecent"] = str(e)
 
-    def ingest_zones(js):
-        def _pct(fgm, fga):
-            try:
-                return round(float(fgm) / float(fga), 3) if (fgm not in (None, "") and fga not in (None, "", 0)) else None
-            except Exception:
-                return None
+    def ingest_zones(js, suffix=""):
         for r in shot_zone_rows(js):
             pid = r.get("PLAYER_ID")
             if pid is None or pid not in players:
                 continue
             p = players[pid]
             g = lambda z: num(r.get(z + "|FGA"))
-            gm = lambda z: num(r.get(z + "|FGM"))
             lc, rc = g("Left Corner 3"), g("Right Corner 3")
-            lcm, rcm = gm("Left Corner 3"), gm("Right Corner 3")
-            p["z_ra"] = g("Restricted Area")
-            p["z_paint"] = g("In The Paint (Non-RA)")
-            p["z_mid"] = g("Mid-Range")
-            p["z_corner3"] = round((lc or 0) + (rc or 0), 3)
-            p["z_above3"] = g("Above the Break 3")
-            # player FG% BY ZONE -> powers the Points / 3PM / 2PM efficiency Cush scores
-            p["z_ra_pct"] = _pct(gm("Restricted Area"), g("Restricted Area"))
-            p["z_paint_pct"] = _pct(gm("In The Paint (Non-RA)"), g("In The Paint (Non-RA)"))
-            p["z_mid_pct"] = _pct(gm("Mid-Range"), g("Mid-Range"))
-            p["z_corner3_pct"] = _pct((lcm or 0) + (rcm or 0), (lc or 0) + (rc or 0))
-            p["z_above3_pct"] = _pct(gm("Above the Break 3"), g("Above the Break 3"))
+            p["z_ra" + suffix] = g("Restricted Area")
+            p["z_paint" + suffix] = g("In The Paint (Non-RA)")
+            p["z_mid" + suffix] = g("Mid-Range")
+            p["z_corner3" + suffix] = round((lc or 0) + (rc or 0), 3)
+            p["z_above3" + suffix] = g("Above the Break 3")
 
     try:
         ingest_zones(get("/leaguedashplayershotlocations", dash({"DistanceRange": "By Zone"})))
     except Exception as e:
         errors["shotZones"] = str(e)
+
+    # LAST-10-GAMES player shot distribution, blended over the season version so the catch-&-shoot
+    # funnel leans on recent form on the PLAYER side too (mirrors the opponent shot-zone blend and
+    # shares the same weight). Tapered by the player's recent games so a thin sample can't dominate.
+    _PZONE_KEYS = ("z_ra", "z_paint", "z_mid", "z_corner3", "z_above3")
+    try:
+        ingest_zones(get("/leaguedashplayershotlocations",
+                         dash({"DistanceRange": "By Zone", "LastNGames": "10"})), "_l10")
+        _PZW = float(os.environ.get("WNBA_DVP_W", "0.60"))
+        _PZFULL = float(os.environ.get("WNBA_DVP_FULL", "6"))
+        for _p in players.values():
+            _rg = _p.get("r_gp") or 0
+            _w = _PZW * min(1.0, (_rg / _PZFULL) if _PZFULL > 0 else 1.0)
+            for _zk in _PZONE_KEYS:
+                _s = _p.get(_zk)
+                _r = _p.get(_zk + "_l10")
+                if _s is not None and _r is not None and _w > 0:
+                    _p[_zk] = round((1.0 - _w) * _s + _w * _r, 3)
+                if (_zk + "_l10") in _p:
+                    del _p[_zk + "_l10"]     # drop temp key so it doesn't bloat the feed
+    except Exception as e:
+        errors["shotZonesL10"] = str(e)
 
     def ingest_scoring(js):
         for r in rows(js):
@@ -392,16 +401,12 @@ def main():
         }
 
     def ingest_passing(js):
-        rs = rows(js)
-        wrote = 0
-        for r in rs:
+        for r in rows(js):
             pid = r.get("PLAYER_ID")
             if pid is None or pid not in players:
                 continue
             ast = num(r.get("AST"))
-            apc = num(r.get("AST_POINTS_CREATED"))
-            if apc is None:
-                apc = num(r.get("AST_PTS_CREATED"))  # fallback field name
+            apc = num(r.get("AST_PTS_CREATED"))
             if not ast or ast <= 0 or apc is None:
                 continue
             ppa = apc / ast
@@ -412,12 +417,6 @@ def main():
                 a3 = 1.0
             players[pid]["astTo3"] = round(a3, 3)
             players[pid]["astTo2"] = round(1.0 - a3, 3)
-            wrote += 1
-        # diagnostic: if nothing was written, record what the endpoint actually returned
-        # (rows=0 -> WNBA has no passing tracking; rows>0 -> a field-name mismatch, keys shown)
-        if wrote == 0:
-            keys = sorted(rs[0].keys())[:45] if rs else []
-            errors["passing_diag"] = "rows=%d wrote=0 keys=%s" % (len(rs), ",".join(keys))
 
     try:
         ingest_passing(get("/leaguedashptstats", ptparams("Passing")))
@@ -449,10 +448,12 @@ def main():
     except Exception as e:
         errors["positions"] = str(e)
 
-    # defense-vs-position accumulator: opp_abbr -> pos -> running totals (filled during ingest_logs)
+    # defense-vs-position accumulator: opp_abbr -> pos -> list of per-game allowed lines (each tagged
+    # with its GAME_DATE), filled during ingest_logs. We keep the raw per-game lines (not running
+    # totals) so the aggregation step can blend a SEASON rate with a LAST-10-GAMES rate per team.
     dvp_acc = {}
-    # raw per-line capture (opp_abbr, pos, game_date, statline) so we can build an L10 DVP below
-    dvp_raw = []
+    # opp_abbr -> set of that defense's game dates, so we can pick each team's most-recent N games.
+    dvp_team_dates = {}
 
     def _fs(pts, reb, ast, stl, blk, tov):
         # PrizePicks WNBA fantasy score
@@ -491,28 +492,25 @@ def main():
                     opp = mu.split(sep)[-1].strip()
                     break
             if pos and opp and (mn or 0) >= 1:
-                d = dvp_acc.setdefault(opp, {}).setdefault(pos, {"gp": 0, "fga": 0.0, "fg3a": 0.0, "twopa": 0.0, "ftm": 0.0, "fta": 0.0, "fs": 0.0, "pts": 0.0, "reb": 0.0, "oreb": 0.0, "dreb": 0.0, "ast": 0.0, "stl": 0.0, "blk": 0.0, "tov": 0.0})
-                d["gp"] += 1
-                d["fga"] += (fga or 0)
-                d["fg3a"] += (fg3a or 0)
-                d["twopa"] += ((fga or 0) - (fg3a or 0))
-                d["ftm"] += (ftm or 0)
-                d["fta"] += (fta or 0)
-                d["fs"] += _fs(pts, reb, ast, stl, blk, tov)
-                d["pts"] += (pts or 0)
-                d["reb"] += (reb or 0)
-                d["oreb"] += (oreb or 0)
-                d["dreb"] += (dreb or 0)
-                d["ast"] += (ast or 0)
-                d["stl"] += (stl or 0)
-                d["blk"] += (blk or 0)
-                d["tov"] += (tov or 0)
-                dvp_raw.append((opp, pos, r.get("GAME_DATE"), {
-                    "fga": (fga or 0), "fg3a": (fg3a or 0), "twopa": ((fga or 0) - (fg3a or 0)),
-                    "ftm": (ftm or 0), "fta": (fta or 0), "fs": _fs(pts, reb, ast, stl, blk, tov),
-                    "pts": (pts or 0), "reb": (reb or 0), "oreb": (oreb or 0), "dreb": (dreb or 0),
-                    "ast": (ast or 0), "stl": (stl or 0), "blk": (blk or 0), "tov": (tov or 0),
-                }))
+                gdate = r.get("GAME_DATE") or ""
+                dvp_acc.setdefault(opp, {}).setdefault(pos, []).append({
+                    "d": gdate,
+                    "fga": (fga or 0),
+                    "fg3a": (fg3a or 0),
+                    "twopa": ((fga or 0) - (fg3a or 0)),
+                    "ftm": (ftm or 0),
+                    "fta": (fta or 0),
+                    "fs": _fs(pts, reb, ast, stl, blk, tov),
+                    "pts": (pts or 0),
+                    "reb": (reb or 0),
+                    "oreb": (oreb or 0),
+                    "dreb": (dreb or 0),
+                    "ast": (ast or 0),
+                    "stl": (stl or 0),
+                    "blk": (blk or 0),
+                    "tov": (tov or 0),
+                })
+                dvp_team_dates.setdefault(opp, set()).add(gdate)
         for pid, gl in tmp.items():
             gl.sort(key=lambda g: (g.get("d") or ""), reverse=True)
             recent = gl[:12]
@@ -531,140 +529,12 @@ def main():
         if p.get("teamId") is not None and p.get("teamAbbr"):
             id2abbr[p["teamId"]] = p["teamAbbr"]
 
-    # ---- ESPN scoreboard fallback: stats.wnba.com occasionally drops a game for a date;
-    # cross-check ESPN's schedule and add any game the stats feed missed so the slate is complete. ----
-    try:
-        _ESPN_SB = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
-        _ESPN2WNBA = {"CONN": "CON", "GS": "GSV", "GSW": "GSV", "LA": "LAS", "LV": "LVA",
-                      "NY": "NYL", "PHO": "PHX", "WSH": "WAS", "POR": "PDX"}
-        _abbr2id = {}
-        for _tid, _ab in id2abbr.items():
-            if _ab:
-                _abbr2id[_ab] = _tid
-        _have = set()
-        for _g in games:
-            _have.add((_g["date"], _g["home"]["id"], _g["away"]["id"]))
-            _have.add((_g["date"], _g["away"]["id"], _g["home"]["id"]))
-        _gmap = {}
-        for _g in games:
-            _gmap[(_g["date"], _g["home"]["id"], _g["away"]["id"])] = _g
-        _odds_added = 0
-
-        def _espn_sb(ymd):
-            _u = _ESPN_SB + "?dates=" + ymd + "&limit=50"
-            try:
-                _r = requests.get(_u, headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"}, timeout=30)
-                _r.raise_for_status()
-                return _r.json()
-            except Exception:
-                try:
-                    return get_url(_u)
-                except Exception:
-                    return {}
-
-        def _abbr_of(c):
-            a = ((c.get("team") or {}).get("abbreviation") or "").upper()
-            return _ESPN2WNBA.get(a, a)
-        def _espn_gameodds(_comp):
-            for _o in (_comp.get("odds") or []):
-                _ou = _o.get("overUnder")
-                if _ou is None:
-                    continue
-                try:
-                    _total = float(_ou)
-                except Exception:
-                    continue
-                _sp = _o.get("spread")
-                try:
-                    _mag = abs(float(_sp)) if _sp not in (None, "") else None
-                except Exception:
-                    _mag = None
-                _hto = _o.get("homeTeamOdds") or {}
-                _ato = _o.get("awayTeamOdds") or {}
-                _hf = bool(_hto.get("favorite"))
-                _af = bool(_ato.get("favorite"))
-                if not _hf and not _af:
-                    _hml, _aml = _hto.get("moneyLine"), _ato.get("moneyLine")
-                    try:
-                        if _hml is not None and _aml is not None:
-                            _hf = float(_hml) < float(_aml); _af = not _hf
-                    except Exception:
-                        pass
-                if not _hf and not _af and _sp not in (None, ""):
-                    try:
-                        _hf = float(_sp) < 0; _af = not _hf
-                    except Exception:
-                        pass
-                _hs = None
-                if _mag is not None:
-                    _hs = (-_mag if _hf else (_mag if _af else None))
-                return _total, _hs
-            return None, None
-
-        _added, _unmapped = 0, []
-        for (_gd, _dow) in _date_list():
-            _mm, _dd, _yy = _gd.split("/")
-            _js = _espn_sb(_yy + _mm + _dd)
-            for _ev in (_js.get("events") or []):
-                _comp = (_ev.get("competitions") or [{}])[0]
-                _cs = _comp.get("competitors") or []
-                _home = next((c for c in _cs if c.get("homeAway") == "home"), None)
-                _away = next((c for c in _cs if c.get("homeAway") == "away"), None)
-                if not _home or not _away:
-                    continue
-                _ha, _aa = _abbr_of(_home), _abbr_of(_away)
-                _hid, _aid = _abbr2id.get(_ha), _abbr2id.get(_aa)
-                if _hid is None or _aid is None:
-                    _unmapped.append(_ha + "@" + _aa)
-                    continue
-                _total, _hs = _espn_gameodds(_comp)
-                _exist = _gmap.get((_gd, _hid, _aid))
-                _existRev = _gmap.get((_gd, _aid, _hid))
-                if _exist is not None or _existRev is not None:
-                    _tg = _exist if _exist is not None else _existRev
-                    if _total is not None:
-                        _tg["total"] = _total
-                    if _hs is not None:
-                        _tg["spreadHome"] = _hs if _exist is not None else (-_hs)
-                    if _total is not None or _hs is not None:
-                        _odds_added += 1
-                    continue
-                _st = ((_comp.get("status") or {}).get("type") or {})
-                _ng = {
-                    "gameId": "espn_" + str(_ev.get("id")), "status": None,
-                    "statusText": (_st.get("shortDetail") or _st.get("detail") or "").strip(),
-                    "date": _gd, "day": _dow,
-                    "home": {"id": _hid, "abbr": _ha},
-                    "away": {"id": _aid, "abbr": _aa},
-                }
-                if _total is not None:
-                    _ng["total"] = _total
-                if _hs is not None:
-                    _ng["spreadHome"] = _hs
-                games.append(_ng)
-                _gmap[(_gd, _hid, _aid)] = _ng
-                _have.add((_gd, _hid, _aid))
-                _have.add((_gd, _aid, _hid))
-                _added += 1
-        if _added:
-            errors["espn_sched_added"] = str(_added)
-        if _odds_added:
-            errors["espn_odds_added"] = str(_odds_added)
-        if _unmapped:
-            errors["espn_sched_unmapped"] = ",".join(sorted(set(_unmapped)))[:120]
-    except Exception as _e:
-        errors["espn_sched"] = str(_e)
-
     teams = {}
     try:
         for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Advanced"}))):
             tid = r.get("TEAM_ID")
             teams[tid] = {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION"),
-                "pace": num(r.get("PACE")), "gp": num(r.get("GP")),
-                # rebound-rate context: how hard this team crashes the O-glass / secures the D-glass.
-                # OREB split -> opp's weak D-glass (low opp drebPct) opens offensive boards; DREB split -> opp's
-                # O-glass crashing (high opp orebPct) steals defensive boards away.
-                "orebPct": num(r.get("OREB_PCT")), "drebPct": num(r.get("DREB_PCT")), "rebPct": num(r.get("REB_PCT"))}
+                "pace": num(r.get("PACE")), "gp": num(r.get("GP"))}
     except Exception as e:
         errors["teamPace"] = str(e)
 
@@ -695,9 +565,6 @@ def main():
             _fta, _fga = num(r.get("FTA")), num(r.get("FGA"))
             t["ftaOff"] = _fta
             t["fgaOff"] = _fga
-            # FGM -> exact expected misses per game (FGA - FGM) for the rebound expected-misses driver.
-            t["fgmOff"] = num(r.get("FGM"))
-            t["fgPct"] = num(r.get("FG_PCT"))
             try:
                 t["ftaRate"] = round(float(_fta) / float(_fga), 3) if (_fta not in (None, "") and _fga not in (None, "", 0)) else None
             except Exception:
@@ -705,267 +572,85 @@ def main():
     except Exception as e:
         errors["teamBase"] = str(e)
 
-    def ingest_team_zones(js):
-        def _pct(fgm, fga):
-            try:
-                return round(float(fgm) / float(fga), 3) if (fgm not in (None, "") and fga not in (None, "", 0)) else None
-            except Exception:
-                return None
+    def ingest_team_zones(js, suffix=""):
         for r in shot_zone_rows(js):
             tid = r.get("TEAM_ID")
             if tid is None:
                 continue
             t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid)})
             gg = lambda z: num(r.get(z + "|FGA"))
-            gm = lambda z: num(r.get(z + "|FGM"))
             lc, rc = gg("Left Corner 3"), gg("Right Corner 3")
-            lcm, rcm = gm("Left Corner 3"), gm("Right Corner 3")
-            t["dz_ra"] = gg("Restricted Area")
-            t["dz_paint"] = gg("In The Paint (Non-RA)")
-            t["dz_mid"] = gg("Mid-Range")
-            t["dz_corner3"] = round((lc or 0) + (rc or 0), 3)
-            t["dz_above3"] = gg("Above the Break 3")
-            # opponent FG% ALLOWED per zone (efficiency / "how easy the bucket is") -> powers efficiency-true Shredder/Lob
-            t["dz_ra_pct"] = _pct(gm("Restricted Area"), gg("Restricted Area"))
-            t["dz_paint_pct"] = _pct(gm("In The Paint (Non-RA)"), gg("In The Paint (Non-RA)"))
-            t["dz_mid_pct"] = _pct(gm("Mid-Range"), gg("Mid-Range"))
-            t["dz_corner3_pct"] = _pct((lcm or 0) + (rcm or 0), (lc or 0) + (rc or 0))
-            t["dz_above3_pct"] = _pct(gm("Above the Break 3"), gg("Above the Break 3"))
+            t["dz_ra" + suffix] = gg("Restricted Area")
+            t["dz_paint" + suffix] = gg("In The Paint (Non-RA)")
+            t["dz_mid" + suffix] = gg("Mid-Range")
+            t["dz_corner3" + suffix] = round((lc or 0) + (rc or 0), 3)
+            t["dz_above3" + suffix] = gg("Above the Break 3")
 
     try:
         ingest_team_zones(get("/leaguedashteamshotlocations", dash({"MeasureType": "Opponent", "DistanceRange": "By Zone"})))
     except Exception as e:
         errors["teamZoneDef"] = str(e)
 
+    # LAST-10-GAMES opponent shot-location defense, blended over the season version so the funnel /
+    # zone-leak logic leans on recent form too (same recency philosophy as the box-score DvP blend).
+    # The team dashboard takes LastNGames natively, so no date reconstruction is needed here.
+    _ZONE_KEYS = ("dz_ra", "dz_paint", "dz_mid", "dz_corner3", "dz_above3")
+    try:
+        ingest_team_zones(get("/leaguedashteamshotlocations",
+                              dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "LastNGames": "10"})), "_l10")
+        _ZW = float(os.environ.get("WNBA_DVP_W", "0.60"))       # max recent weight (shared with DvP blend)
+        _ZFULL = float(os.environ.get("WNBA_DVP_FULL", "6"))    # recent games before the weight caps out
+        for _t in teams.values():
+            _nwin = min(10, _t.get("gp") or 0)
+            _w = _ZW * min(1.0, (_nwin / _ZFULL) if _ZFULL > 0 else 1.0)
+            for _zk in _ZONE_KEYS:
+                _s = _t.get(_zk)
+                _r = _t.get(_zk + "_l10")
+                if _s is not None and _r is not None and _w > 0:
+                    _t[_zk] = round((1.0 - _w) * _s + _w * _r, 3)
+                if (_zk + "_l10") in _t:
+                    del _t[_zk + "_l10"]     # drop the temp key so it doesn't bloat the feed
+    except Exception as e:
+        errors["teamZoneDefL10"] = str(e)
+
     # attach defense-vs-position per-game allowances (G/F/C) to each team
     abbr2id = {v: k for k, v in id2abbr.items()}
+    DVP_KEYS = ["fga", "fg3a", "twopa", "ftm", "fta", "fs", "pts", "reb", "oreb", "dreb", "ast", "stl", "blk", "tov"]
+    DVP_L10_N = int(os.environ.get("WNBA_DVP_L10", "10"))     # size of the recent window (team games)
+    DVP_L10_W = float(os.environ.get("WNBA_DVP_W", "0.60"))   # max weight on the recent window when it's full
+    DVP_L10_FULL = float(os.environ.get("WNBA_DVP_FULL", "6"))  # games needed before recent weight caps out
+
+    def _dvp_rate(lines):
+        gp = len(lines)
+        if gp <= 0:
+            return None, 0
+        return ({k: sum(x[k] for x in lines) / gp for k in DVP_KEYS}, gp)
+
     for opp_abbr, posmap in dvp_acc.items():
         tid = abbr2id.get(opp_abbr)
         if tid is None or tid not in teams:
             continue
+        # the defending team's most-recent game dates -> the last-10 window (fewer early in the year).
+        recent_dates = set(sorted(dvp_team_dates.get(opp_abbr, set()), reverse=True)[:DVP_L10_N])
+        # lean on the recent window in proportion to how many recent games we actually have, so a
+        # 3-game-old sample doesn't swing a rank; caps at DVP_L10_W once >= DVP_L10_FULL recent games.
+        w = DVP_L10_W * min(1.0, (len(recent_dates) / DVP_L10_FULL) if DVP_L10_FULL > 0 else 1.0)
         dvp = {}
-        for pos, d in posmap.items():
-            gp = d.get("gp") or 0
-            if gp <= 0:
+        for pos, lines in posmap.items():
+            season_rate, season_gp = _dvp_rate(lines)
+            if season_rate is None:
                 continue
-            dvp[pos] = {
-                "gp": gp,
-                "fga": round(d["fga"] / gp, 2),
-                "fg3a": round(d["fg3a"] / gp, 2),
-                "twopa": round(d["twopa"] / gp, 2),
-                "ftm": round(d["ftm"] / gp, 2),
-                "fta": round(d["fta"] / gp, 2),
-                "fs": round(d["fs"] / gp, 2),
-                "pts": round(d["pts"] / gp, 2),
-                "reb": round(d["reb"] / gp, 2),
-                "oreb": round(d["oreb"] / gp, 2),
-                "dreb": round(d["dreb"] / gp, 2),
-                "ast": round(d["ast"] / gp, 2),
-                "stl": round(d["stl"] / gp, 2),
-                "blk": round(d["blk"] / gp, 2),
-                "tov": round(d["tov"] / gp, 2),
-            }
+            l10_rate, l10_gp = _dvp_rate([x for x in lines if x["d"] in recent_dates])
+            if l10_rate is None or w <= 0:
+                blended = season_rate
+            else:
+                blended = {k: (1.0 - w) * season_rate[k] + w * l10_rate[k] for k in DVP_KEYS}
+            entry = {"gp": season_gp, "l10gp": l10_gp}
+            for k in DVP_KEYS:
+                entry[k] = round(blended[k], 2)
+            dvp[pos] = entry
         if dvp:
             teams[tid]["dvp"] = dvp
-
-    # ===================== LAST-10-GAMES (L10) SCORING INPUTS =====================
-    # Every input the dashboard's Cush score engine consumes, re-pulled over the last
-    # 10 games and stored in a nested "l10" block on each player/team. Season fields
-    # above are left untouched; the front-end overlays this block when L10 is selected.
-    def _pct10(a, b):
-        try:
-            return round(float(a) / float(b), 3) if (a not in (None, "") and b not in (None, "", 0)) else None
-        except Exception:
-            return None
-
-    # --- players: L10 base stats (remap the already-fetched r_* last-10 averages) ---
-    _BASEMAP = {"gp": "r_gp", "min": "r_min", "fga": "r_fga", "fg3a": "r_fg3a", "pts": "r_pts",
-                "ftm": "r_ftm", "fta": "r_fta", "ftPct": "r_ftPct", "reb": "r_reb", "ast": "r_ast",
-                "stl": "r_stl", "blk": "r_blk", "tov": "r_tov", "pf": "r_pf"}
-    for _p in players.values():
-        _d = _p.setdefault("l10", {})
-        for _k, _rk in _BASEMAP.items():
-            if _p.get(_rk) is not None:
-                _d[_k] = _p.get(_rk)
-
-    # --- players: L10 shot zones (attempts + FG% by zone) ---
-    def ingest_zones_l10(js):
-        for r in shot_zone_rows(js):
-            pid = r.get("PLAYER_ID")
-            if pid is None or pid not in players:
-                continue
-            d = players[pid].setdefault("l10", {})
-            g = lambda z: num(r.get(z + "|FGA"))
-            gm = lambda z: num(r.get(z + "|FGM"))
-            lc, rc = g("Left Corner 3"), g("Right Corner 3")
-            lcm, rcm = gm("Left Corner 3"), gm("Right Corner 3")
-            d["z_ra"] = g("Restricted Area")
-            d["z_paint"] = g("In The Paint (Non-RA)")
-            d["z_mid"] = g("Mid-Range")
-            d["z_corner3"] = round((lc or 0) + (rc or 0), 3)
-            d["z_above3"] = g("Above the Break 3")
-            d["z_ra_pct"] = _pct10(gm("Restricted Area"), g("Restricted Area"))
-            d["z_paint_pct"] = _pct10(gm("In The Paint (Non-RA)"), g("In The Paint (Non-RA)"))
-            d["z_mid_pct"] = _pct10(gm("Mid-Range"), g("Mid-Range"))
-            d["z_corner3_pct"] = _pct10((lcm or 0) + (rcm or 0), (lc or 0) + (rc or 0))
-            d["z_above3_pct"] = _pct10(gm("Above the Break 3"), g("Above the Break 3"))
-
-    try:
-        ingest_zones_l10(get("/leaguedashplayershotlocations", dash({"DistanceRange": "By Zone", "LastNGames": "10"})))
-    except Exception as e:
-        errors["shotZones_l10"] = str(e)
-
-    # --- players: L10 assisted% (catch&shoot proxy) ---
-    def ingest_scoring_l10(js):
-        for r in rows(js):
-            pid = r.get("PLAYER_ID")
-            if pid is None or pid not in players:
-                continue
-            d = players[pid].setdefault("l10", {})
-            d["ast3Pct"] = num(r.get("PCT_AST_3PM"))
-            d["ast2Pct"] = num(r.get("PCT_AST_2PM"))
-            d["astFgPct"] = num(r.get("PCT_AST_FGM"))
-
-    try:
-        ingest_scoring_l10(get("/leaguedashplayerstats", dash({"MeasureType": "Scoring", "LastNGames": "10"})))
-    except Exception as e:
-        errors["scoring_l10"] = str(e)
-
-    # --- teams: L10 pace / opponent / base / zone-defense ---
-    try:
-        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Advanced", "LastNGames": "10"}))):
-            tid = r.get("TEAM_ID")
-            if tid in teams:
-                teams[tid].setdefault("l10", {})["pace"] = num(r.get("PACE"))
-    except Exception as e:
-        errors["teamPace_l10"] = str(e)
-    try:
-        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent", "LastNGames": "10"}))):
-            tid = r.get("TEAM_ID")
-            if tid not in teams:
-                continue
-            d = teams[tid].setdefault("l10", {})
-            d["oppFga"] = num(r.get("OPP_FGA"))
-            d["oppFg3a"] = num(r.get("OPP_FG3A"))
-            d["oppFg3Pct"] = num(r.get("OPP_FG3_PCT"))
-            d["oppFta"] = num(r.get("OPP_FTA"))
-            d["oppAstRate"] = _pct10(r.get("OPP_AST"), r.get("OPP_FGM"))
-    except Exception as e:
-        errors["teamOpp_l10"] = str(e)
-    try:
-        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Base", "LastNGames": "10"}))):
-            tid = r.get("TEAM_ID")
-            if tid not in teams:
-                continue
-            d = teams[tid].setdefault("l10", {})
-            _fta, _fga = num(r.get("FTA")), num(r.get("FGA"))
-            d["ftaOff"] = _fta
-            d["fgaOff"] = _fga
-            d["ftaRate"] = _pct10(_fta, _fga)
-    except Exception as e:
-        errors["teamBase_l10"] = str(e)
-
-    def ingest_team_zones_l10(js):
-        for r in shot_zone_rows(js):
-            tid = r.get("TEAM_ID")
-            if tid is None or tid not in teams:
-                continue
-            d = teams[tid].setdefault("l10", {})
-            gg = lambda z: num(r.get(z + "|FGA"))
-            gm = lambda z: num(r.get(z + "|FGM"))
-            lc, rc = gg("Left Corner 3"), gg("Right Corner 3")
-            lcm, rcm = gm("Left Corner 3"), gm("Right Corner 3")
-            d["dz_ra"] = gg("Restricted Area")
-            d["dz_paint"] = gg("In The Paint (Non-RA)")
-            d["dz_mid"] = gg("Mid-Range")
-            d["dz_corner3"] = round((lc or 0) + (rc or 0), 3)
-            d["dz_above3"] = gg("Above the Break 3")
-            d["dz_ra_pct"] = _pct10(gm("Restricted Area"), gg("Restricted Area"))
-            d["dz_paint_pct"] = _pct10(gm("In The Paint (Non-RA)"), gg("In The Paint (Non-RA)"))
-            d["dz_mid_pct"] = _pct10(gm("Mid-Range"), gg("Mid-Range"))
-            d["dz_corner3_pct"] = _pct10((lcm or 0) + (rcm or 0), (lc or 0) + (rc or 0))
-            d["dz_above3_pct"] = _pct10(gm("Above the Break 3"), gg("Above the Break 3"))
-
-    try:
-        ingest_team_zones_l10(get("/leaguedashteamshotlocations", dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "LastNGames": "10"})))
-    except Exception as e:
-        errors["teamZoneDef_l10"] = str(e)
-
-    # --- teams: L10 defense-vs-position (only each defense's last 10 game-dates) ---
-    try:
-        by_opp_dates = {}
-        for (opp_abbr, pos, gdate, sl) in dvp_raw:
-            if opp_abbr and gdate:
-                by_opp_dates.setdefault(opp_abbr, set()).add(gdate)
-        last10 = {o: set(sorted(ds, reverse=True)[:10]) for o, ds in by_opp_dates.items()}
-        _SUMK = ("fga", "fg3a", "twopa", "ftm", "fta", "fs", "pts", "reb", "oreb", "dreb", "ast", "stl", "blk", "tov")
-        dvp_acc_l10 = {}
-        for (opp_abbr, pos, gdate, sl) in dvp_raw:
-            if not opp_abbr or gdate not in last10.get(opp_abbr, ()):
-                continue
-            d = dvp_acc_l10.setdefault(opp_abbr, {}).setdefault(pos, {"gp": 0})
-            d["gp"] += 1
-            for kk in _SUMK:
-                d[kk] = d.get(kk, 0.0) + (sl.get(kk, 0) or 0)
-        for opp_abbr, posmap in dvp_acc_l10.items():
-            tid = abbr2id.get(opp_abbr)
-            if tid is None or tid not in teams:
-                continue
-            dvp = {}
-            for pos, d in posmap.items():
-                gp = d.get("gp") or 0
-                if gp <= 0:
-                    continue
-                dvp[pos] = {"gp": gp}
-                for kk in _SUMK:
-                    dvp[pos][kk] = round(d.get(kk, 0.0) / gp, 2)
-            if dvp:
-                teams[tid].setdefault("l10", {})["dvp"] = dvp
-    except Exception as e:
-        errors["dvp_l10"] = str(e)
-    # =================== END LAST-10-GAMES (L10) INPUTS ===================
-
-    # Synergy play types -> player OFFENSE (P&R ball handler / roll man) + team DEFENSE (PPP allowed).
-    # WNBA synergy coverage is uncertain, so this is fully guarded and self-diagnosing: the
-    # errors["synergy_diag"] counts tell us on the first run whether the WNBA exposes this feed.
-    def synparams(playtype, grouping, port):
-        return {
-            "LeagueID": LEAGUE, "PerMode": "PerGame", "PlayType": playtype,
-            "PlayerOrTeam": port, "SeasonType": "Regular Season",
-            "SeasonYear": SEASON, "TypeGrouping": grouping,
-        }
-
-    def ingest_syn_off(js, pfx):
-        n = 0
-        for r in rows(js):
-            pid = r.get("PLAYER_ID")
-            if pid is None or pid not in players:
-                continue
-            players[pid][pfx + "Ppp"] = num(r.get("PPP"))       # points per possession
-            players[pid][pfx + "Freq"] = num(r.get("POSS_PCT"))  # how often the player runs this action
-            players[pid][pfx + "Pct"] = num(r.get("PERCENTILE"))
-            n += 1
-        return n
-
-    def ingest_syn_def(js, pfx):
-        n = 0
-        for r in rows(js):
-            tid = r.get("TEAM_ID")
-            if tid is None or tid not in teams:
-                continue
-            teams[tid][pfx + "Ppp"] = num(r.get("PPP"))          # points per possession ALLOWED
-            teams[tid][pfx + "Pct"] = num(r.get("PERCENTILE"))
-            n += 1
-        return n
-
-    try:
-        _snO1 = ingest_syn_off(get("/synergyplaytypes", synparams("PRBallHandler", "offensive", "P")), "prbh")
-        _snO2 = ingest_syn_off(get("/synergyplaytypes", synparams("PRRollMan", "offensive", "P")), "prrm")
-        _snD1 = ingest_syn_def(get("/synergyplaytypes", synparams("PRBallHandler", "defensive", "T")), "prbhDef")
-        _snD2 = ingest_syn_def(get("/synergyplaytypes", synparams("PRRollMan", "defensive", "T")), "prrmDef")
-        errors["synergy_diag"] = "prbhOff=%d prrmOff=%d prbhDef=%d prrmDef=%d" % (_snO1, _snO2, _snD1, _snD2)
-    except Exception as e:
-        errors["synergy"] = str(e)
 
     # Real player availability from ESPN (Out / Doubtful / Questionable / Day-To-Day).
     inj_map, inj_matched = {}, 0
