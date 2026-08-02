@@ -6,10 +6,16 @@ name: Refresh umpires
 # assignments and light up the UMP column, without re-pulling all the heavy feeds.
 on:
   schedule:
-    # Times are UTC. Summer (EDT = UTC-4): 18:00->2pm, 21:00->5pm, 23:00->7pm ET.
-    - cron: '0 18 * * *'
-    - cron: '0 21 * * *'
-    - cron: '0 23 * * *'
+    # Times are UTC. Summer (EDT = UTC-4). MLB posts plate umps game-day, some in the
+    # late morning (day games) and more through the afternoon (night games), so pull
+    # several times across morning + afternoon to catch them as they post.
+    - cron: '0 14 * * *'   # 10:00 AM ET
+    - cron: '0 15 * * *'   # 11:00 AM ET
+    - cron: '0 16 * * *'   # 12:00 PM ET
+    - cron: '0 17 * * *'   #  1:00 PM ET
+    - cron: '0 19 * * *'   #  3:00 PM ET
+    - cron: '0 21 * * *'   #  5:00 PM ET
+    - cron: '0 23 * * *'   #  7:00 PM ET
   workflow_dispatch:
 
 permissions:
