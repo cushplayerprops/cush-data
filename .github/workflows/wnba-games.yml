@@ -1,0 +1,31 @@
+name: Refresh WNBA team game logs
+
+on:
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Pull latest season game logs
+        run: node pull_wnba_games.mjs
+      - name: Commit if changed
+        run: |
+          git config user.name  "wnba-bot"
+          git config user.email "wnba-bot@users.noreply.github.com"
+          git add wnba_team_games.json
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git commit -m "Auto-refresh WNBA game logs"
+            git push
+          fi
