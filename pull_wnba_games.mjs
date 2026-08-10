@@ -3,7 +3,7 @@
 // from ESPN's free public API and writes wnba_team_games.json.
 // No dependencies — uses Node 18+ built-in fetch. Runs on GitHub Actions.
 
-const SEASON = Number(process.env.WNBA_SEASON) || 2025;
+const SEASON = Number(process.env.WNBA_SEASON) || 2026;
 const BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba";
 const OUT = "wnba_team_games.json";
 
@@ -34,7 +34,8 @@ async function teamList() {
   return arr.map(t => t.team).filter(Boolean).map(t => ({
     id: String(t.id),
     abbr: t.abbreviation || (t.shortDisplayName || "").toUpperCase(),
-    name: t.displayName || t.name
+    name: t.displayName || t.name,
+    logo: (t.logos && t.logos[0] && t.logos[0].href) || null
   }));
 }
 
@@ -74,14 +75,14 @@ async function teamGames(team) {
   for (const t of teams) {
     try {
       const g = await teamGames(t);
-      out.teams[t.abbr] = { name: t.name, abbr: t.abbr, games: g };
+      out.teams[t.abbr] = { name: t.name, abbr: t.abbr, logo: t.logo, games: g };
       total += g.length;
       console.log(`${t.abbr.padEnd(4)} ${t.name.padEnd(24)} ${g.length} games`);
     } catch (e) {
       console.error(`FAILED ${t.abbr}: ${e.message}`);
-      out.teams[t.abbr] = { name: t.name, abbr: t.abbr, games: [] };
+      out.teams[t.abbr] = { name: t.name, abbr: t.abbr, logo: t.logo, games: [] };
     }
-    await new Promise(res => setTimeout(res, 400)); // be polite
+    await new Promise(res => setTimeout(res, 400));
   }
   const fs = await import("node:fs");
   fs.writeFileSync(OUT, JSON.stringify(out));
