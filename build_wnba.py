@@ -325,6 +325,20 @@ def main():
     except Exception as e:
         errors["playersRecent"] = str(e)
 
+    # per-zone FG% = FGM/FGA (real makes over attempts), so the app's points/makes
+    # metrics (PTS/3PM/2PM) have a scoring-efficiency value per zone, not just attempts.
+    def _zpct(r, z):
+        fgm = num(r.get(z + "|FGM")); fga = num(r.get(z + "|FGA"))
+        if fgm is None or fga is None or fga <= 0:
+            return None
+        return round(fgm / fga, 3)
+
+    def _zpct2(r, za, zb):   # combined corner 3 (makes-weighted across L+R)
+        ma_, aa = num(r.get(za + "|FGM")), num(r.get(za + "|FGA"))
+        mb, ab = num(r.get(zb + "|FGM")), num(r.get(zb + "|FGA"))
+        tot_m = (ma_ or 0) + (mb or 0); tot_a = (aa or 0) + (ab or 0)
+        return round(tot_m / tot_a, 3) if tot_a > 0 else None
+
     def ingest_zones(js, suffix=""):
         for r in shot_zone_rows(js):
             pid = r.get("PLAYER_ID")
@@ -338,33 +352,39 @@ def main():
             p["z_mid" + suffix] = g("Mid-Range")
             p["z_corner3" + suffix] = round((lc or 0) + (rc or 0), 3)
             p["z_above3" + suffix] = g("Above the Break 3")
+            p["z_ra_pct" + suffix] = _zpct(r, "Restricted Area")
+            p["z_paint_pct" + suffix] = _zpct(r, "In The Paint (Non-RA)")
+            p["z_mid_pct" + suffix] = _zpct(r, "Mid-Range")
+            p["z_corner3_pct" + suffix] = _zpct2(r, "Left Corner 3", "Right Corner 3")
+            p["z_above3_pct" + suffix] = _zpct(r, "Above the Break 3")
 
     try:
         ingest_zones(get("/leaguedashplayershotlocations", dash({"DistanceRange": "By Zone"})))
     except Exception as e:
         errors["shotZones"] = str(e)
 
-    # LAST-10-GAMES player shot distribution, blended over the season version so the catch-&-shoot
-    # funnel leans on recent form on the PLAYER side too (mirrors the opponent shot-zone blend and
-    # shares the same weight). Tapered by the player's recent games so a thin sample can't dominate.
-    _PZONE_KEYS = ("z_ra", "z_paint", "z_mid", "z_corner3", "z_above3")
-    try:
-        ingest_zones(get("/leaguedashplayershotlocations",
-                         dash({"DistanceRange": "By Zone", "LastNGames": "10"})), "_l10")
-        _PZW = float(os.environ.get("WNBA_DVP_W", "0.60"))
-        _PZFULL = float(os.environ.get("WNBA_DVP_FULL", "6"))
-        for _p in players.values():
-            _rg = _p.get("r_gp") or 0
-            _w = _PZW * min(1.0, (_rg / _PZFULL) if _PZFULL > 0 else 1.0)
-            for _zk in _PZONE_KEYS:
-                _s = _p.get(_zk)
-                _r = _p.get(_zk + "_l10")
-                if _s is not None and _r is not None and _w > 0:
-                    _p[_zk] = round((1.0 - _w) * _s + _w * _r, 3)
-                if (_zk + "_l10") in _p:
-                    del _p[_zk + "_l10"]     # drop temp key so it doesn't bloat the feed
-    except Exception as e:
-        errors["shotZonesL10"] = str(e)
+    # PLAYER shot zones are SEASON by default (a player's shot profile is a stable trait).
+    # Set WNBA_PZONE_W > 0 to blend in a Last-10 recency component; 0 = pure season, no extra proxy call.
+    _PZONE_KEYS = ("z_ra", "z_paint", "z_mid", "z_corner3", "z_above3",
+                   "z_ra_pct", "z_paint_pct", "z_mid_pct", "z_corner3_pct", "z_above3_pct")
+    _PZW = float(os.environ.get("WNBA_PZONE_W", "0.0"))
+    if _PZW > 0:
+        try:
+            ingest_zones(get("/leaguedashplayershotlocations",
+                             dash({"DistanceRange": "By Zone", "LastNGames": "10"})), "_l10")
+            _PZFULL = float(os.environ.get("WNBA_DVP_FULL", "6"))
+            for _p in players.values():
+                _rg = _p.get("r_gp") or 0
+                _w = _PZW * min(1.0, (_rg / _PZFULL) if _PZFULL > 0 else 1.0)
+                for _zk in _PZONE_KEYS:
+                    _s = _p.get(_zk)
+                    _r = _p.get(_zk + "_l10")
+                    if _s is not None and _r is not None and _w > 0:
+                        _p[_zk] = round((1.0 - _w) * _s + _w * _r, 3)
+                    if (_zk + "_l10") in _p:
+                        del _p[_zk + "_l10"]     # drop temp key so it doesn't bloat the feed
+        except Exception as e:
+            errors["shotZonesL10"] = str(e)
 
     def ingest_scoring(js):
         for r in rows(js):
@@ -585,6 +605,12 @@ def main():
             t["dz_mid" + suffix] = gg("Mid-Range")
             t["dz_corner3" + suffix] = round((lc or 0) + (rc or 0), 3)
             t["dz_above3" + suffix] = gg("Above the Break 3")
+            # opponent FG% ALLOWED per zone (FGM/FGA from the Opponent measure) -> defense efficiency
+            t["dz_ra_pct" + suffix] = _zpct(r, "Restricted Area")
+            t["dz_paint_pct" + suffix] = _zpct(r, "In The Paint (Non-RA)")
+            t["dz_mid_pct" + suffix] = _zpct(r, "Mid-Range")
+            t["dz_corner3_pct" + suffix] = _zpct2(r, "Left Corner 3", "Right Corner 3")
+            t["dz_above3_pct" + suffix] = _zpct(r, "Above the Break 3")
 
     try:
         ingest_team_zones(get("/leaguedashteamshotlocations", dash({"MeasureType": "Opponent", "DistanceRange": "By Zone"})))
@@ -594,11 +620,14 @@ def main():
     # LAST-10-GAMES opponent shot-location defense, blended over the season version so the funnel /
     # zone-leak logic leans on recent form too (same recency philosophy as the box-score DvP blend).
     # The team dashboard takes LastNGames natively, so no date reconstruction is needed here.
-    _ZONE_KEYS = ("dz_ra", "dz_paint", "dz_mid", "dz_corner3", "dz_above3")
+    # OPPONENT DEFENSE zones are L10 by default (defense form is recent). WNBA_DZONE_W=1.0 means
+    # fully Last-10, still tapered by games played so an early-season thin sample falls back to season.
+    _ZONE_KEYS = ("dz_ra", "dz_paint", "dz_mid", "dz_corner3", "dz_above3",
+                  "dz_ra_pct", "dz_paint_pct", "dz_mid_pct", "dz_corner3_pct", "dz_above3_pct")
     try:
         ingest_team_zones(get("/leaguedashteamshotlocations",
                               dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "LastNGames": "10"})), "_l10")
-        _ZW = float(os.environ.get("WNBA_DVP_W", "0.60"))       # max recent weight (shared with DvP blend)
+        _ZW = float(os.environ.get("WNBA_DZONE_W", "1.0"))      # 1.0 = pure L10 defense (tapered early season)
         _ZFULL = float(os.environ.get("WNBA_DVP_FULL", "6"))    # recent games before the weight caps out
         for _t in teams.values():
             _nwin = min(10, _t.get("gp") or 0)
