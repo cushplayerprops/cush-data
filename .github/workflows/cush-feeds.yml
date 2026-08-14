@@ -41,13 +41,17 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
+          # Stage DATA files only, never anything under .github. The Actions GITHUB_TOKEN
+          # lacks `workflows` scope, so any push that touches a workflow file is rejected.
+          git add -A -- ':!.github'
           git commit -m "update cush feeds" || { echo "no changes"; exit 0; }
-          # Resilient push: if the remote moved on, merge it in but KEEP our freshly-built feed
-          # files (-s ours), then push. Retry a few times so a transient race never hard-fails.
+          # Resilient push: REBASE our data-only commit onto the latest main. We must NOT use
+          # `merge -s ours`, which rewrites tracked files (like this workflow yml) and trips the
+          # `workflows` permission block. `-X ours` keeps our freshly-built feeds on any data
+          # conflict. Retry a few times so a transient race never hard-fails.
           for i in 1 2 3 4 5; do
             git fetch origin main || true
-            git merge -s ours origin/main -m "merge remote main (keep fresh feeds)" || true
+            git rebase -X ours origin/main || git rebase --abort || true
             if git push origin HEAD:main; then echo "pushed on attempt $i"; exit 0; fi
             echo "push attempt $i failed; retrying..."; sleep $((5 * i))
           done
