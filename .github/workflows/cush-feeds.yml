@@ -29,6 +29,7 @@ jobs:
           python build_team_offense_recent.py || echo "team_offense failed"
           python build_hitter_ewma.py || echo "hitter_ewma failed"
           python build_pitcher_ewma.py || echo "pitcher_ewma failed"
+          python enrich_pitcher_form.py || echo "pitcher_form failed"
           python build_hand_splits.py || echo "hand_splits failed"
           python enrich_hand_splits_xstats.py || echo "xstats enrich failed"
           python build_hitter_logs.py || echo "hitter_logs failed"
