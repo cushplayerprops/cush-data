@@ -310,6 +310,8 @@ def main():
             p[prefix + "fta"] = num(r.get("FTA"))
             p[prefix + "ftPct"] = num(r.get("FT_PCT"))
             p[prefix + "reb"] = num(r.get("REB"))
+            p[prefix + "oreb"] = num(r.get("OREB"))   # offensive rebounds / game
+            p[prefix + "dreb"] = num(r.get("DREB"))   # defensive rebounds / game
             p[prefix + "ast"] = num(r.get("AST"))
             p[prefix + "stl"] = num(r.get("STL"))
             p[prefix + "blk"] = num(r.get("BLK"))
@@ -324,6 +326,28 @@ def main():
         ingest(get("/leaguedashplayerstats", dash({"LastNGames": "10"})), "r_")
     except Exception as e:
         errors["playersRecent"] = str(e)
+
+    # ADVANCED measure -> true on-court RATE stats (share of available boards / teammate makes,
+    # pace-independent). These are the "does the player actually convert the matchup" numbers.
+    def ingest_advanced(js, prefix=""):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            p = players[pid]
+            p[prefix + "orebPct"] = num(r.get("OREB_PCT"))   # % of available OREB grabbed on court
+            p[prefix + "drebPct"] = num(r.get("DREB_PCT"))   # % of available DREB grabbed on court
+            p[prefix + "rebPct"]  = num(r.get("REB_PCT"))
+            p[prefix + "astPct"]  = num(r.get("AST_PCT"))    # % of teammate FGM assisted on court
+            p[prefix + "usgPct"]  = num(r.get("USG_PCT"))
+    try:
+        ingest_advanced(get("/leaguedashplayerstats", dash({"MeasureType": "Advanced", "LastNGames": "0"})), "")
+    except Exception as e:
+        errors["advanced"] = str(e)
+    try:
+        ingest_advanced(get("/leaguedashplayerstats", dash({"MeasureType": "Advanced", "LastNGames": "10"})), "r_")
+    except Exception as e:
+        errors["advancedRecent"] = str(e)
 
     # per-zone FG% = FGM/FGA (real makes over attempts), so the app's points/makes
     # metrics (PTS/3PM/2PM) have a scoring-efficiency value per zone, not just attempts.
@@ -425,6 +449,8 @@ def main():
             pid = r.get("PLAYER_ID")
             if pid is None or pid not in players:
                 continue
+            players[pid]["potAst"] = num(r.get("POTENTIAL_AST"))   # passes that would be assists if made
+            players[pid]["passesMade"] = num(r.get("PASSES_MADE"))
             ast = num(r.get("AST"))
             apc = num(r.get("AST_PTS_CREATED"))
             if not ast or ast <= 0 or apc is None:
@@ -442,6 +468,25 @@ def main():
         ingest_passing(get("/leaguedashptstats", ptparams("Passing")))
     except Exception as e:
         errors["passing"] = str(e)
+
+    # REBOUNDING tracking -> rebound OPPORTUNITY: how many boards the player was in position for
+    # (chances), how often they converted them, and contested boards. The "was he even there" stat.
+    def ingest_rebounding(js):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            p = players[pid]
+            p["rebChances"]    = num(r.get("REB_CHANCES"))    # total rebound chances / game
+            p["orebChances"]   = num(r.get("OREB_CHANCES"))
+            p["drebChances"]   = num(r.get("DREB_CHANCES"))
+            p["orebChancePct"] = num(r.get("OREB_CHANCE_PCT"))  # OREB grabbed / OREB chances
+            p["drebChancePct"] = num(r.get("DREB_CHANCE_PCT"))
+            p["contestedReb"]  = num(r.get("C_REB"))            # contested rebounds / game
+    try:
+        ingest_rebounding(get("/leaguedashptstats", ptparams("Rebounding")))
+    except Exception as e:
+        errors["rebounding"] = str(e)
 
     # Player positions (single call) -> G/F/C bucket. Needed for defense-vs-position aggregation.
     def pos_bucket(s):
