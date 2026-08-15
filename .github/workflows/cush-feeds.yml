@@ -32,6 +32,7 @@ jobs:
           python enrich_pitcher_form.py || echo "pitcher_form failed"
           python build_hand_splits.py || echo "hand_splits failed"
           python enrich_hand_splits_xstats.py || echo "xstats enrich failed"
+          python build_pitcher_hand_splits.py || echo "pitcher_hand_splits failed"
           python build_hitter_logs.py || echo "hitter_logs failed"
           python build_pitcher_logs.py || echo "pitcher_logs failed"
           python build_projections.py || echo "projections failed"
