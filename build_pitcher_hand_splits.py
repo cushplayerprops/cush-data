@@ -5,7 +5,7 @@ build_pitcher_hand_splits.py  —  cush-data pipeline step
 Builds pitcher_hand_splits.json: per-pitcher Statcast EXPECTED stats ALLOWED,
 split by the OPPOSING BATTER's hand (the `stand` column):
 
-    entry["L"] = {xwoba,xba,xslg, xwoba_l30,xba_l30,xslg_l30, pa}   # allowed vs LHB
+    entry["L"] = {xwoba,xba,xslg, kpct,bbpct, xwoba_l30,xba_l30,xslg_l30, kpct_l30,bbpct_l30, pa}  # allowed vs LHB
     entry["R"] = { ... }                                            # allowed vs RHB
 
 This is the pitcher-side mirror of batter_hand_splits.json's .L / .R buckets.
@@ -105,8 +105,8 @@ def aggregate_by_stand(text):
         except (ValueError, IndexError):
             return float("nan")
 
-    acc = {"L": {"ab": 0, "xba": 0.0, "xslg": 0.0, "wden": 0.0, "xnum": 0.0},
-           "R": {"ab": 0, "xba": 0.0, "xslg": 0.0, "wden": 0.0, "xnum": 0.0}}
+    acc = {"L": {"ab": 0, "xba": 0.0, "xslg": 0.0, "wden": 0.0, "xnum": 0.0, "pa": 0, "k": 0, "bb": 0},
+           "R": {"ab": 0, "xba": 0.0, "xslg": 0.0, "wden": 0.0, "xnum": 0.0, "pa": 0, "k": 0, "bb": 0}}
     for row in rows[1:]:
         try:
             ev = row[idx["events"]].strip()
@@ -118,6 +118,11 @@ def aggregate_by_stand(text):
         if st not in ("L", "R"):
             continue
         a = acc[st]
+        a["pa"] += 1                                    # every row here is a PA-ending event
+        if ev in ("strikeout", "strikeout_double_play"):
+            a["k"] += 1
+        elif ev in ("walk", "intent_walk"):
+            a["bb"] += 1
         typ = row[idx["type"]].strip()
         wd, wv = f(row, "woba_denom"), f(row, "woba_value")
         xw = f(row, "estimated_woba_using_speedangle")
@@ -143,7 +148,11 @@ def aggregate_by_stand(text):
         if a["ab"] > 0:
             o["xba"] = round(a["xba"] / a["ab"], 3)
             o["xslg"] = round(a["xslg"] / a["ab"], 3)
+        if a["pa"] > 0:                                 # K%/BB% allowed vs this batter hand
+            o["kpct"] = round(100.0 * a["k"] / a["pa"], 1)
+            o["bbpct"] = round(100.0 * a["bb"] / a["pa"], 1)
         o["_ab"] = a["ab"]
+        o["_pa"] = a["pa"]
         o["_wden"] = round(a["wden"], 1)
         out[st] = o
     return out
@@ -198,6 +207,10 @@ def main():
                     b["xslg"] = sv["xslg"]
                 if "xwoba" in sv:
                     b["xwoba"] = sv["xwoba"]
+                if "kpct" in sv:
+                    b["kpct"] = sv["kpct"]
+                if "bbpct" in sv:
+                    b["bbpct"] = sv["bbpct"]
                 b["pa"] = int(round(sv.get("_wden", 0)))
             lv = (l30 or {}).get(st) or {}
             if lv.get("_ab", 0) >= L30_MIN_AB:
@@ -205,6 +218,10 @@ def main():
                     b["xba_l30"] = lv["xba"]
                 if "xslg" in lv:
                     b["xslg_l30"] = lv["xslg"]
+                if "kpct" in lv:
+                    b["kpct_l30"] = lv["kpct"]
+                if "bbpct" in lv:
+                    b["bbpct_l30"] = lv["bbpct"]
             if lv.get("_wden", 0) >= L30_MIN_WDEN and "xwoba" in lv:
                 b["xwoba_l30"] = lv["xwoba"]
             if b:
