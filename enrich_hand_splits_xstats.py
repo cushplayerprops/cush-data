@@ -19,10 +19,14 @@ The aggregation mirrors netlify/functions/savant.js line-for-line and is
 validated to reproduce Baseball Savant's official leaderboard
 (Aaron Judge 2025: xBA .299 vs .300, xSLG .707 vs .708, xwOBA .461 vs .460).
 
-The L30 window is a rolling last-N-days pull (default 30) via Statcast's
-game_date filters. Small hand-split samples (esp. vs LHP) are noisy, so an L30
-bucket is only written when it clears a minimum AB / wOBA-denominator; otherwise
-the field is left absent and the app falls back to season-expected / actual.
+The recent window is a rolling last-N-days pull via Statcast's game_date filters,
+and is HAND-SPECIFIC: vs RHP uses a 14-day window (PAs vs righties accrue fast
+enough for a 2-week read), while vs LHP keeps the 30-day window (lefty starters
+are rarer, so a longer pull is needed to clear the min sample). Both are written
+into the same `xwoba_l30`/`xba_l30`/`xslg_l30` fields the app already reads.
+Small hand-split samples (esp. vs LHP) are noisy, so a bucket is only written
+when it clears a minimum AB / wOBA-denominator; otherwise the field is left
+absent and the app falls back to season-expected / actual.
 
 Runs in the daily Build-Cush-feeds Action right after build_hand_splits.py.
 Stdlib only (urllib) — no pip installs needed. Idempotent + re-runnable.
@@ -31,7 +35,8 @@ Env (all optional):
     YEAR          Statcast season (default: current UTC year)
     WORKERS       parallel requests (default 6)
     FORCE         "1" to recompute buckets that already have the stats
-    L30_DAYS      rolling recency window in days (default 30)
+    L30_DAYS      rolling recency window in days, vs LHP (default 30)
+    L14_DAYS      rolling recency window in days, vs RHP (default 14)
     L30_MIN_AB    min at-bats to accept an L30 xBA/xSLG bucket (default 15)
     L30_MIN_WDEN  min wOBA denominator to accept an L30 xwOBA bucket (default 18)
 """
@@ -45,6 +50,7 @@ WORKERS = int(os.environ.get("WORKERS", "6"))
 FORCE   = os.environ.get("FORCE") == "1"
 
 L30_DAYS     = int(os.environ.get("L30_DAYS", "30"))
+L14_DAYS     = int(os.environ.get("L14_DAYS", "14"))   # vs-RHP recent window (larger sample accrues faster)
 L30_MIN_AB   = int(os.environ.get("L30_MIN_AB", "15"))
 L30_MIN_WDEN = float(os.environ.get("L30_MIN_WDEN", "18"))
 
@@ -56,7 +62,14 @@ AB_EXCLUDE = {"walk", "intent_walk", "hit_by_pitch", "sac_fly", "sac_fly_double_
 # are inclusive, so [today-L30_DAYS, today] captures the last ~L30_DAYS of games.
 _TODAY = datetime.date.today()
 L30_FROM = (_TODAY - datetime.timedelta(days=L30_DAYS)).isoformat()
+L14_FROM = (_TODAY - datetime.timedelta(days=L14_DAYS)).isoformat()
 L30_TO   = _TODAY.isoformat()
+
+# Recency window is hand-specific: vs RHP uses the shorter L14 window (PAs vs
+# righties accrue fast enough for a 2-week sample), vs LHP keeps the L30 window
+# (lefty starters are rarer, so a 30-day pull is needed to clear the min sample).
+def _recent_from(hand):
+    return L14_FROM if hand == "R" else L30_FROM
 
 
 def statcast_url(pid, hand, dfrom=None, dto=None):
@@ -166,8 +179,8 @@ def main():
             if need_season or need_l30:
                 jobs.append((pid, hand))
 
-    print("batters: %d | buckets to enrich: %d | season %s | L30 window %s..%s"
-          % (len(data), len(jobs), YEAR, L30_FROM, L30_TO))
+    print("batters: %d | buckets to enrich: %d | season %s | recent: R %s..%s (L%d) / L %s..%s (L%d)"
+          % (len(data), len(jobs), YEAR, L14_FROM, L30_TO, L14_DAYS, L30_FROM, L30_TO, L30_DAYS))
 
     filled = [0]
     filled30 = [0]
@@ -185,9 +198,11 @@ def main():
                     b["xslg"] = ov["xslg"]
                 if "xwoba" in ov:
                     b["xwoba"] = ov["xwoba"]
-        # --- last-30-days (new) ---
+        # --- recent window (hand-specific: L14 vs RHP, L30 vs LHP) ---
         if FORCE or b.get("xba_l30") is None or b.get("xslg_l30") is None:
-            ov = fetch_agg(statcast_url(pid, hand, L30_FROM, L30_TO), "%s %s L30" % (pid, hand))
+            _rfrom = _recent_from(hand)
+            ov = fetch_agg(statcast_url(pid, hand, _rfrom, L30_TO),
+                           "%s %s L%d" % (pid, hand, L14_DAYS if hand == "R" else L30_DAYS))
             if ov:
                 if ov.get("_ab", 0) >= L30_MIN_AB:
                     if "xba" in ov:
