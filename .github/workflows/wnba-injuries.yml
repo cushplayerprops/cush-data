@@ -1,0 +1,56 @@
+name: Update WNBA injuries
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Injury-ONLY refresh: free ESPN feed, no full stats rebuild / no ScrapeOps cost.
+    # Times are UTC. WNBA season = CDT (UTC-5).
+    # Once in the morning, then every 10 min from 1:10 PM to 7:10 PM CDT (18:10-00:10 UTC).
+    # NOTE: GitHub scheduled crons are best-effort and often delayed under load, so the
+    # 10-minute spacing is a target, not a guarantee.
+    - cron: "17 13 * * *"                       # ~8:17 AM CDT morning refresh
+    - cron: "10,20,30,40,50 18 * * *"           # 1:10-1:50 PM CDT
+    - cron: "0,10,20,30,40,50 19-23 * * *"      # 2:00-6:50 PM CDT
+    - cron: "0,10 0 * * *"                      # 7:00 & 7:10 PM CDT
+
+permissions:
+  contents: write
+
+# Never let two injury refreshes overlap (they'd race on the git push).
+concurrency:
+  group: cush-wnba-injuries
+  cancel-in-progress: false
+
+jobs:
+  injuries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Refresh injuries in wnba_stats.json
+        env:
+          SCRAPEOPS_API_KEY: ${{ secrets.SCRAPEOPS_API_KEY }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Retry loop: each attempt resets to the latest main (picking up any full
+          # build that landed meanwhile), re-applies injuries, and pushes. This makes
+          # the updater safe against races with the full wnba.yml build without needing
+          # a shared concurrency group across workflows.
+          for i in 1 2 3 4 5; do
+            git fetch origin main && git reset --hard origin/main
+            python update_injuries.py || { echo "script error, skipping"; exit 0; }
+            git add wnba_stats.json
+            if git diff --staged --quiet; then echo "no injury change"; exit 0; fi
+            git commit -m "update injuries [skip ci]"
+            if git push; then echo "pushed"; exit 0; fi
+            echo "push race, retry $i"; sleep $((RANDOM % 8 + 4))
+          done
+          echo "gave up after 5 retries"
