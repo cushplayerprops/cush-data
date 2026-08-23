@@ -604,7 +604,7 @@ def main():
         errors["teamPace"] = str(e)
 
     try:
-        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent"}))):
+        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent", "LastNGames": "10"}))):
             tid = r.get("TEAM_ID")
             t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
             t["oppFga"] = num(r.get("OPP_FGA"))
@@ -691,7 +691,7 @@ def main():
     abbr2id = {v: k for k, v in id2abbr.items()}
     DVP_KEYS = ["fga", "fg3a", "twopa", "ftm", "fta", "fs", "pts", "reb", "oreb", "dreb", "ast", "stl", "blk", "tov"]
     DVP_L10_N = int(os.environ.get("WNBA_DVP_L10", "10"))     # size of the recent window (team games)
-    DVP_L10_W = float(os.environ.get("WNBA_DVP_W", "0.60"))   # max weight on the recent window when it's full
+    DVP_L10_W = float(os.environ.get("WNBA_DVP_W", "1.0"))   # max weight on the recent window when it's full
     DVP_L10_FULL = float(os.environ.get("WNBA_DVP_FULL", "6"))  # games needed before recent weight caps out
 
     def _dvp_rate(lines):
