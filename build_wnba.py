@@ -524,6 +524,38 @@ def main():
         # PrizePicks WNBA fantasy score
         return (pts or 0) + 1.2 * (reb or 0) + 1.5 * (ast or 0) + 3 * (stl or 0) + 3 * (blk or 0) - (tov or 0)
 
+    def classify_arche(p):
+        # Player archetype from her shot-zone profile + assisted%, MUST match the app's wnbaArchClass:
+        #   SELF = self-creator guard (mid) | CS = catch-and-shoot wing (threes) | BIG = roll/paint big.
+        # Powers defense-vs-archetype (dvpArche): fantasy/pts/reb/ast a defense concedes to players like her.
+        if not p:
+            return None
+        zk = ("ra", "paint", "mid", "corner3", "above3")
+        zs = {}
+        tot = 0.0
+        for k in zk:
+            v = p.get("z_" + k)
+            v = 0.0 if (v is None) else v
+            zs[k] = v
+            tot += v
+        if tot <= 0:
+            return None
+        t3 = (zs["corner3"] + zs["above3"]) / tot
+        inte = (zs["ra"] + zs["paint"]) / tot
+        pos = (p.get("pos") or "").upper()
+        big = pos in ("F", "C")
+        a3 = p.get("ast3Pct")
+        af = p.get("astFgPct")
+        if t3 >= 0.42 and a3 is not None and a3 >= 0.62 and (af is None or af >= 0.50):
+            return "CS"
+        if big and inte >= 0.45 and inte >= t3:
+            return "BIG"
+        if not big:
+            return "SELF"
+        if t3 >= 0.40:
+            return "CS"
+        return "BIG"
+
     # Per-game logs (recent games) -> powers L10 hit-rate + out/usage flags.
     # PerMode=Totals gives each game's actual raw stat line.
     def ingest_logs(js):
@@ -560,6 +592,7 @@ def main():
                 gdate = r.get("GAME_DATE") or ""
                 dvp_acc.setdefault(opp, {}).setdefault(pos, []).append({
                     "d": gdate,
+                    "pid": pid,
                     "fga": (fga or 0),
                     "fg3a": (fg3a or 0),
                     "twopa": ((fga or 0) - (fg3a or 0)),
@@ -725,6 +758,34 @@ def main():
             dvp[pos] = entry
         if dvp:
             teams[tid]["dvp"] = dvp
+
+    # defense-vs-ARCHETYPE: re-bucket the same per-game allowed lines by the opposing player's archetype
+    # (self-creator / catch-shoot / roll-paint big) instead of position. Backtest: fantasy CUSH-only
+    # 53.2% -> 56.5% vs the pts+ast composition. Season mean per archetype (fs/pts/reb/ast).
+    ARCHE_STATS = ["fs", "pts", "reb", "ast"]
+    ARCHE_MIN_GP = int(os.environ.get("WNBA_DVPARCHE_MIN", "3"))
+    for opp_abbr, posmap in dvp_acc.items():
+        tid = abbr2id.get(opp_abbr)
+        if tid is None or tid not in teams:
+            continue
+        buckets = {}
+        for pos, lines in posmap.items():
+            for x in lines:
+                a = classify_arche(players.get(x.get("pid")))
+                if not a:
+                    continue
+                buckets.setdefault(a, []).append(x)
+        dvpA = {}
+        for a, lines in buckets.items():
+            gp = len(lines)
+            if gp < ARCHE_MIN_GP:
+                continue
+            entry = {"gp": gp}
+            for k in ARCHE_STATS:
+                entry[k] = round(sum(v[k] for v in lines) / gp, 2)
+            dvpA[a] = entry
+        if dvpA:
+            teams[tid]["dvpArche"] = dvpA
 
     # Real player availability from ESPN (Out / Doubtful / Questionable / Day-To-Day).
     inj_map, inj_matched = {}, 0
