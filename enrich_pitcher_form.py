@@ -53,11 +53,14 @@ L30_TO   = _TODAY.isoformat()
 
 def statcast_url(pid, dfrom=None, dto=None):
     # NOTE: pitch-by-pitch pitcher queries return ZERO rows from Savant unless
-    # min_results / min_pas are pinned to 0 (this is the exact param set that
-    # build_pitcher_ewma.py uses successfully). We intentionally do NOT set
-    # group_by, so the response stays per-pitch (needed for velo/whiff/CSW).
+    # min_results / min_pas are pinned to 0 AND group_by=name is set. Dropping
+    # group_by makes statcast_search return an empty CSV, which is why this feed
+    # was writing {} every run. build_pitcher_ewma.py uses exactly this param set
+    # (group_by=name) and still gets one row PER PITCH back, which is what our
+    # aggregate() needs for velo / whiff / CSW -- grouping does not collapse the
+    # per-pitch rows in the details CSV, it only pins the query so Savant serves it.
     u = (SAVANT + "/statcast_search/csv?all=true&type=details&player_type=pitcher"
-         "&hfSea=" + YEAR + "%7C&min_pitches=0&min_results=0&min_pas=0"
+         "&hfSea=" + YEAR + "%7C&group_by=name&min_pitches=0&min_results=0&min_pas=0"
          "&pitchers_lookup%5B%5D=" + str(pid))
     if dfrom and dto:
         u += "&game_date_gt=" + dfrom + "&game_date_lt=" + dto
