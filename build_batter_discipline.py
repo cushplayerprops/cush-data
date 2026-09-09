@@ -1,58 +1,51 @@
 #!/usr/bin/env python3
 # build_batter_discipline.py
 # Pulls MLB batter plate-discipline (chase / whiff / contact / swing / K%) from
-# Baseball Savant's custom leaderboard CSV and writes batter_discipline.json for
-# the Cush Player Props Strikeout model (opponent side of the matchup).
+# Baseball Savant and writes batter_discipline.json for the Cush Player Props
+# Strikeout model (opponent side of the matchup). Keyed by MLBAM player_id.
 #
-# Runs in a GitHub Action (Savant is reachable there). Keyed by MLBAM player_id,
-# which matches the ids the app already uses for lineups / hand splits.
-#
-# In addition to the SEASON figures, this now emits a rolling LAST-30-DAYS
-# discipline split with the suffix "_l30":
+# SEASON figures come from the custom leaderboard (one light CSV for everyone).
+# The rolling LAST-30-DAYS split (suffix "_l30") is computed PER BATTER from the
+# pitch-by-pitch statcast_search endpoint -- the same endpoint enrich_pitcher_form
+# uses -- because that endpoint honors an explicit date range (game_date_gt/lt),
+# whereas the custom leaderboard silently ignores start/end dates.
 #     chase_l30, whiff_l30, izCon_l30, ozCon_l30
 # The Strikeout model reads these ONLY for hitters facing a RHP (its _bdv reader
-# uses *_l30 when present, else falls back to the season value), so a wrong or
-# ignored date filter can never break the model -- it simply stays on season.
-# To keep that guarantee, the L30 pass is SELF-VALIDATING: it is only written if
-# the date-ranged fetch is provably a smaller window than the season pull.
-import csv, io, json, sys, datetime, urllib.request
+# uses *_l30 when present, else falls back to the season value), so if the L30
+# pass yields nothing the model simply stays on season -- never broken.
+import csv, io, json, sys, os, time, datetime, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 YEAR = datetime.date.today().year
 
-# rolling recent window (days) used for the *_l30 discipline split
-L30_DAYS      = 30
-L30_MIN_PA    = 20     # per-batter min PA in the window to accept an _l30 value
-# If the "date-ranged" fetch comes back with per-batter PA this close to the
-# season pull, Savant ignored the date filter -> we DROP the whole L30 pass
-# rather than write season numbers mislabeled as recent form.
-L30_MAX_RATIO = 0.60
+SAVANT = "https://baseballsavant.mlb.com"
 
+# ---- rolling recent window (pitch-level, per batter) -----------------------
+L30_DAYS      = int(os.environ.get("L30_DAYS", "30"))
+L30_MIN_PITCH = int(os.environ.get("L30_MIN_PITCH", "50"))   # gate a batter's L30 bucket
+WORKERS       = int(os.environ.get("WORKERS", "5"))
 _TODAY   = datetime.date.today()
 L30_FROM = (_TODAY - datetime.timedelta(days=L30_DAYS)).isoformat()
 L30_TO   = _TODAY.isoformat()
 
+# swing / whiff pitch descriptions -- identical to enrich_pitcher_form / savant.js
+WHIFF_DESC = {"swinging_strike", "swinging_strike_blocked", "foul_tip"}
+SWING_DESC = {"swinging_strike", "swinging_strike_blocked", "foul", "foul_tip", "hit_into_play"}
 
-def savant_url(year, min_pa=25, dfrom=None, dto=None):
+
+def savant_url(year, min_pa=25):
     sels = "pa,k_percent,swing_percent,whiff_percent,oz_swing_percent,iz_contact_percent,oz_contact_percent"
-    u = ("https://baseballsavant.mlb.com/leaderboard/custom"
-         "?year=%d&type=batter&filter=&min=%d"
-         "&selections=%s&sort=pa&sortDir=desc&csv=true" % (year, min_pa, sels))
-    # Rolling-window split. Savant's custom leaderboard honors an explicit
-    # start/end date range; if a given deployment's Savant ignores it, the
-    # self-validation below (L30_MAX_RATIO) catches the no-op and we skip L30.
-    if dfrom and dto:
-        u += "&startdt=%s&enddt=%s" % (dfrom, dto)
-    return u
+    return ("https://baseballsavant.mlb.com/leaderboard/custom"
+            "?year=%d&type=batter&filter=&min=%d"
+            "&selections=%s&sort=pa&sortDir=desc&csv=true" % (year, min_pa, sels))
 
-def fetch_csv(url):
+def fetch_csv(url, ua_win=True):
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36") if ua_win else "Mozilla/5.0"
     req = urllib.request.Request(url, headers={
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-        "Accept": "text/csv,application/csv,*/*",
-    })
+        "User-Agent": ua, "Accept": "text/csv,application/csv,*/*"})
     with urllib.request.urlopen(req, timeout=90) as r:
-        # utf-8-sig strips the BOM Savant prepends, which otherwise mis-splits
-        # the first ("last_name, first_name") column and shifts every field over.
+        # utf-8-sig strips the BOM Savant prepends on the leaderboard CSV.
         return r.read().decode("utf-8-sig", "replace")
 
 def num(x):
@@ -70,9 +63,12 @@ def col(row, *names):
             return low[n]
     return None
 
-def parse_rows(text):
-    """CSV text -> {pid: {chase,whiff,izCon,ozCon,pa}} (raw, unrounded)."""
-    rows = list(csv.DictReader(io.StringIO(text)))
+def build(year):
+    """Season plate-discipline for every qualified batter (custom leaderboard)."""
+    url = savant_url(year)
+    print("GET(season)", url)
+    rows = list(csv.DictReader(io.StringIO(fetch_csv(url))))
+    print("rows:", len(rows))
     out = {}
     for row in rows:
         pid = col(row, "player_id", "playerid", "mlbam_id", "id")
@@ -81,26 +77,13 @@ def parse_rows(text):
         pid = str(pid).strip()
         if not pid.isdigit():
             continue
-        out[pid] = {
-            "chase": num(col(row, "oz_swing_percent", "o_swing_percent", "chase_percent")),
-            "whiff": num(col(row, "whiff_percent")),
-            "swing": num(col(row, "swing_percent")),
-            "kPct":  num(col(row, "k_percent", "strikeout_percent")),
-            "izCon": num(col(row, "iz_contact_percent", "in_zone_contact_percent")),
-            "ozCon": num(col(row, "oz_contact_percent", "out_zone_contact_percent")),
-            "pa":    num(col(row, "pa", "b_total_pa", "plate_appearances")),
-        }
-    return out, len(rows)
-
-def build(year):
-    url = savant_url(year)
-    print("GET(season)", url)
-    raw, nrows = parse_rows(fetch_csv(url))
-    print("rows:", nrows)
-    out = {}
-    for pid, v in raw.items():
-        chase, whiff, kpct = v["chase"], v["whiff"], v["kPct"]
-        pa = v["pa"]
+        chase = num(col(row, "oz_swing_percent", "o_swing_percent", "chase_percent"))
+        whiff = num(col(row, "whiff_percent"))
+        swing = num(col(row, "swing_percent"))
+        kpct  = num(col(row, "k_percent", "strikeout_percent"))
+        izc   = num(col(row, "iz_contact_percent", "in_zone_contact_percent"))
+        ozc   = num(col(row, "oz_contact_percent", "out_zone_contact_percent"))
+        pa    = num(col(row, "pa", "b_total_pa", "plate_appearances"))
         contact = (round(100.0 - whiff, 1)) if whiff is not None else None
         if chase is None and whiff is None and kpct is None:
             continue
@@ -108,73 +91,124 @@ def build(year):
             "chase":  round(chase, 1) if chase is not None else None,
             "whiff":  round(whiff, 1) if whiff is not None else None,
             "contact": contact,
-            "swing":  round(v["swing"], 1) if v["swing"] is not None else None,
+            "swing":  round(swing, 1) if swing is not None else None,
             "kPct":   round(kpct, 1)  if kpct  is not None else None,
-            "izCon":  round(v["izCon"], 1) if v["izCon"] is not None else None,
-            "ozCon":  round(v["ozCon"], 1) if v["ozCon"] is not None else None,
+            "izCon":  round(izc, 1)   if izc   is not None else None,
+            "ozCon":  round(ozc, 1)   if ozc   is not None else None,
             "pa":     int(pa)         if pa    is not None else None,
         }
     return out
 
-def enrich_l30(data, year):
-    """Add chase_l30/whiff_l30/izCon_l30/ozCon_l30 to `data` in place.
+# ---- pitch-level LAST-30-DAYS discipline, per batter -----------------------
 
-    Self-validating: only writes _l30 fields if the date-ranged pull is
-    demonstrably a *smaller* window than the season pull (proving Savant honored
-    the start/end dates). On any doubt it writes nothing, so the model keeps
-    using season values for RHP matchups -- never season numbers mislabeled as
-    recent form.
+def batter_l30_url(pid, dfrom, dto):
+    # Mirrors enrich_pitcher_form's proven param set: group_by=name + the three
+    # min_* pinned to 0 are what make statcast_search actually return rows, and
+    # game_date_gt/lt gives a REAL date window (unlike the custom leaderboard).
+    return (SAVANT + "/statcast_search/csv?all=true&type=details&player_type=batter"
+            "&hfSea=" + str(YEAR) + "%7C&group_by=name&min_pitches=0&min_results=0&min_pas=0"
+            "&batters_lookup%5B%5D=" + str(pid)
+            + "&game_date_gt=" + dfrom + "&game_date_lt=" + dto)
+
+def agg_l30(text):
+    """Per-pitch CSV -> {chase,whiff,izCon,ozCon,pitches} for one batter, or None.
+
+    zone 1-9 = in the strike zone, 11-14 = out of zone (Savant's `zone` field).
+    chase = swings at out-of-zone pitches / out-of-zone pitches
+    whiff = whiffs / swings
+    izCon = contact on in-zone swings / in-zone swings
+    ozCon = contact on out-of-zone swings / out-of-zone swings
     """
-    url = savant_url(year, min_pa=10, dfrom=L30_FROM, dto=L30_TO)
-    print("GET(L30)", url)
-    try:
-        raw, nrows = parse_rows(fetch_csv(url))
-    except Exception as e:
-        print("L30 fetch failed (%s); leaving season-only" % e)
-        return 0
-    print("L30 rows:", nrows)
-    if not raw:
-        print("L30 empty; leaving season-only")
-        return 0
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return None
+    idx = {k.strip(): i for i, k in enumerate(rows[0])}
+    if "description" not in idx or "zone" not in idx:
+        return None
 
-    # Validate the window actually shrank vs season. Compare per-batter PA for
-    # batters present in both pulls; the median recent/season ratio should be
-    # well under L30_MAX_RATIO for a true ~30-day window mid/late season.
-    ratios = []
-    for pid, v in raw.items():
-        p30 = v["pa"]
-        pse = data.get(pid, {}).get("pa")
-        if p30 and pse and pse > 0:
-            ratios.append(p30 / float(pse))
-    if not ratios:
-        print("L30 has no PA overlap with season; leaving season-only")
-        return 0
-    ratios.sort()
-    med = ratios[len(ratios) // 2]
-    print("L30 median PA ratio vs season: %.2f (need < %.2f)" % (med, L30_MAX_RATIO))
-    if med >= L30_MAX_RATIO:
-        print("L30 window ~= season -> Savant ignored the date filter; SKIPPING L30")
-        return 0
+    def g(row, key):
+        try:
+            return row[idx[key]].strip()
+        except (IndexError, KeyError):
+            return ""
 
-    written = 0
-    for pid, v in raw.items():
-        if pid not in data:
+    inz_p = inz_sw = inz_con = 0
+    ooz_p = ooz_sw = ooz_con = 0
+    swings = whiffs = 0
+    for row in rows[1:]:
+        desc = g(row, "description")
+        if not desc:
             continue
-        p30 = v["pa"]
-        if p30 is None or p30 < L30_MIN_PA:
+        try:
+            zi = int(float(g(row, "zone")))
+        except ValueError:
             continue
-        wrote_any = False
+        inzone = 1 <= zi <= 9
+        is_swing = desc in SWING_DESC
+        is_whiff = desc in WHIFF_DESC
+        is_contact = is_swing and not is_whiff
+        if inzone:
+            inz_p += 1
+            if is_swing: inz_sw += 1
+            if is_contact: inz_con += 1
+        else:
+            ooz_p += 1
+            if is_swing: ooz_sw += 1
+            if is_contact: ooz_con += 1
+        if is_swing: swings += 1
+        if is_whiff: whiffs += 1
+
+    tot = inz_p + ooz_p
+    if tot == 0:
+        return None
+    out = {"pitches": tot}
+    if ooz_p > 0:  out["chase"] = round(100.0 * ooz_sw / ooz_p, 1)
+    if swings > 0: out["whiff"] = round(100.0 * whiffs / swings, 1)
+    if inz_sw > 0: out["izCon"] = round(100.0 * inz_con / inz_sw, 1)
+    if ooz_sw > 0: out["ozCon"] = round(100.0 * ooz_con / ooz_sw, 1)
+    return out
+
+def fetch_l30(pid):
+    url = batter_l30_url(pid, L30_FROM, L30_TO)
+    for attempt in range(3):
+        try:
+            return agg_l30(fetch_csv(url, ua_win=False))
+        except Exception as e:                       # noqa: BLE001
+            if attempt == 2:
+                print("  ! %s L30: %s" % (pid, e), file=sys.stderr)
+                return None
+            time.sleep(0.8 * (attempt + 1))
+    return None
+
+def enrich_l30(data):
+    """Add chase_l30/whiff_l30/izCon_l30/ozCon_l30 in place, pitch-level per batter."""
+    ids = list(data.keys())
+    print("L30 pitch-level enrich: %d batters | %s..%s | workers=%d min_pitch=%d"
+          % (len(ids), L30_FROM, L30_TO, WORKERS, L30_MIN_PITCH))
+    written = [0]
+
+    def work(pid):
+        ov = fetch_l30(pid)
+        if not ov or ov.get("pitches", 0) < L30_MIN_PITCH:
+            return
+        wrote = False
         for src, dst in (("chase", "chase_l30"), ("whiff", "whiff_l30"),
                          ("izCon", "izCon_l30"), ("ozCon", "ozCon_l30")):
-            val = v[src]
-            if val is not None:
-                data[pid][dst] = round(val, 1)
-                wrote_any = True
-        if wrote_any:
-            data[pid]["pa_l30"] = int(p30)
-            written += 1
-    print("L30 written for %d batters (>= %d PA in window)" % (written, L30_MIN_PA))
-    return written
+            if ov.get(src) is not None:
+                data[pid][dst] = ov[src]
+                wrote = True
+        if wrote:
+            data[pid]["pitches_l30"] = ov["pitches"]
+            written[0] += 1
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        for _ in ex.map(work, ids):
+            done += 1
+            if done % 80 == 0:
+                print("  ...%d/%d (%d filled)" % (done, len(ids), written[0]))
+    print("L30 written for %d batters (>= %d pitches in window)" % (written[0], L30_MIN_PITCH))
+    return written[0]
 
 def main():
     year = YEAR
@@ -189,7 +223,6 @@ def main():
             prev = build(year - 1)
             if len(prev) > len(data):
                 data = prev
-                year = year - 1
         except Exception as e:
             print("prev-year fetch failed:", e)
 
@@ -199,7 +232,7 @@ def main():
 
     # rolling last-30-days discipline split (season stays the backbone)
     try:
-        enrich_l30(data, year)
+        enrich_l30(data)
     except Exception as e:
         print("L30 enrich errored (%s); season-only output" % e)
 
@@ -215,7 +248,6 @@ def main():
         "with_l30": n_l30,
         "lg_chase": avg("chase"),
         "lg_whiff": avg("whiff"),
-        "lg_contact": avg("contact"),
         "lg_kPct": avg("kPct"),
     })
 
