@@ -1,70 +1,69 @@
 #!/usr/bin/env python3
 """
-enrich_pitcher_form.py  —  cush-data pipeline step
+enrich_pitcher_form.py  —  cush-data pipeline step (LIGHT, self-refreshing)
 
-Builds pitcher_form.json: leading-indicator "form/fatigue" signals from Statcast
-for each pitcher, computed for the full SEASON and a rolling LAST-30-DAYS window.
+Builds pitcher_form.json: leading-indicator "form/fatigue" signals from Statcast.
+For each pitcher we make ONE bounded pitch-level pull (the last BASE_DAYS days)
+and split it, in memory, into two non-overlapping windows:
 
-Per pitcher (keyed by MLBAM id):
-    veloFb   / veloFb_l30    fastball (FF/SI/FT) average release speed, mph
-    whiff    / whiff_l30      whiff% = swinging strikes / swings
-    csw      / csw_l30        CSW% = (called strikes + swinging strikes) / pitches
-    pitches  / pitches_l30    sample sizes
+    baseline  = pitches 31..BASE_DAYS days ago   -> veloFb / whiff / csw
+    recent    = pitches in the last L30_DAYS days -> veloFb_l30 / whiff_l30 / csw_l30
 
-These are the stats that LEAD outcomes (a fading fastball or slipping whiff rate
-shows up weeks before ERA does), so the app blends recent-vs-season on THESE for
-pitcher form instead of noisy outcome stats. L30 buckets are sample-gated.
+The app's strikeout model reads the *dip* (veloFb_l30 - veloFb, whiff_l30 - whiff),
+so a fading fastball or slipping whiff over the last month shows up as recent-vs-prior.
 
-Mirrors netlify/functions/savant.js swing/whiff definitions. Stdlib only (urllib).
-Idempotent + re-runnable. Reads the pitcher id list from an existing feed file.
+Why this shape: the previous version pulled every pitch of the FULL SEASON per
+pitcher, which Savant times out on -- ~400 pitchers x a season-sized CSV made the
+job run for an hour and still write {}. A bounded window is small enough to fetch
+reliably (this is the same per-entity, date-ranged mechanism the batter L30 feed
+uses successfully) and every run REFRESHES (no skip-if-present), so the recent
+signal actually stays current day to day.
+
+Stdlib only. Reads the pitcher id list from an existing feed file (pitcher_ewma.json).
 
 Env (all optional):
     YEAR            Statcast season (default: current UTC year)
-    WORKERS         parallel requests (default 5)
-    IDS_FILE        feed file to read pitcher ids from (default pitcher_ewma.json)
+    WORKERS         parallel requests (default 8)
+    IDS_FILE        feed to read pitcher ids from (default pitcher_ewma.json)
     OUT_FILE        output (default pitcher_form.json)
-    L30_DAYS        rolling window in days (default 30)
-    L30_MIN_PITCH   min pitches to accept an L30 bucket (default 120)
-    FORCE           "1" to recompute pitchers that already have data
+    BASE_DAYS       total lookback window in days (default 90)
+    L30_DAYS        recent window in days (default 30)
+    MIN_BASE_PITCH  min pitches to accept a baseline bucket (default 100)
+    MIN_L30_PITCH   min pitches to accept a recent bucket (default 60)
 """
 
 import json, os, sys, csv, io, time, datetime, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-YEAR          = os.environ.get("YEAR") or str(time.gmtime().tm_year)
-WORKERS       = int(os.environ.get("WORKERS", "5"))
-IDS_FILE      = os.environ.get("IDS_FILE", "pitcher_ewma.json")
-OUT_FILE      = os.environ.get("OUT_FILE", "pitcher_form.json")
-L30_DAYS      = int(os.environ.get("L30_DAYS", "30"))
-L30_MIN_PITCH = int(os.environ.get("L30_MIN_PITCH", "120"))
-FORCE         = os.environ.get("FORCE") == "1"
+YEAR           = os.environ.get("YEAR") or str(time.gmtime().tm_year)
+WORKERS        = int(os.environ.get("WORKERS", "8"))
+IDS_FILE       = os.environ.get("IDS_FILE", "pitcher_ewma.json")
+OUT_FILE       = os.environ.get("OUT_FILE", "pitcher_form.json")
+BASE_DAYS      = int(os.environ.get("BASE_DAYS", "90"))
+L30_DAYS       = int(os.environ.get("L30_DAYS", "30"))
+MIN_BASE_PITCH = int(os.environ.get("MIN_BASE_PITCH", "100"))
+MIN_L30_PITCH  = int(os.environ.get("MIN_L30_PITCH", "60"))
 
 SAVANT = "https://baseballsavant.mlb.com"
 FASTBALLS = {"FF", "SI", "FT"}
-# swing / whiff descriptions — identical to savant.js
+# swing / whiff descriptions -- identical to savant.js / the batter feed
 WHIFF_DESC = {"swinging_strike", "swinging_strike_blocked", "foul_tip"}
 SWING_DESC = {"swinging_strike", "swinging_strike_blocked", "foul", "foul_tip", "hit_into_play"}
 CALLED = "called_strike"
 
-_TODAY = datetime.date.today()
-L30_FROM = (_TODAY - datetime.timedelta(days=L30_DAYS)).isoformat()
-L30_TO   = _TODAY.isoformat()
+_TODAY    = datetime.date.today()
+BASE_FROM = (_TODAY - datetime.timedelta(days=BASE_DAYS)).isoformat()
+L30_CUT   = (_TODAY - datetime.timedelta(days=L30_DAYS)).isoformat()
+TO        = _TODAY.isoformat()
 
 
-def statcast_url(pid, dfrom=None, dto=None):
-    # NOTE: pitch-by-pitch pitcher queries return ZERO rows from Savant unless
-    # min_results / min_pas are pinned to 0 AND group_by=name is set. Dropping
-    # group_by makes statcast_search return an empty CSV, which is why this feed
-    # was writing {} every run. build_pitcher_ewma.py uses exactly this param set
-    # (group_by=name) and still gets one row PER PITCH back, which is what our
-    # aggregate() needs for velo / whiff / CSW -- grouping does not collapse the
-    # per-pitch rows in the details CSV, it only pins the query so Savant serves it.
-    u = (SAVANT + "/statcast_search/csv?all=true&type=details&player_type=pitcher"
-         "&hfSea=" + YEAR + "%7C&group_by=name&min_pitches=0&min_results=0&min_pas=0"
-         "&pitchers_lookup%5B%5D=" + str(pid))
-    if dfrom and dto:
-        u += "&game_date_gt=" + dfrom + "&game_date_lt=" + dto
-    return u
+def statcast_url(pid):
+    # group_by=name + the three min_* pinned to 0 are what make statcast_search
+    # actually return rows; game_date_gt/lt bounds it to the last BASE_DAYS days.
+    return (SAVANT + "/statcast_search/csv?all=true&type=details&player_type=pitcher"
+            "&hfSea=" + YEAR + "%7C&group_by=name&min_pitches=0&min_results=0&min_pas=0"
+            "&pitchers_lookup%5B%5D=" + str(pid)
+            + "&game_date_gt=" + BASE_FROM + "&game_date_lt=" + TO)
 
 
 def fetch_csv(url):
@@ -74,30 +73,16 @@ def fetch_csv(url):
         return r.read().decode("utf-8", "replace")
 
 
-def aggregate(text):
-    """Return {'veloFb','whiff','csw','pitches'} or None."""
-    rows = list(csv.reader(io.StringIO(text)))
-    if not rows:
-        return None
-    idx = {k.strip(): i for i, k in enumerate(rows[0])}
-    need = ["pitch_type", "description", "release_speed"]
-    if any(k not in idx for k in need):
-        return None
-
+def agg(rows, idx):
+    """Aggregate a list of per-pitch rows -> {veloFb,whiff,csw,pitches} or None."""
     def g(row, key):
         try:
             return row[idx[key]].strip()
         except (IndexError, KeyError):
             return ""
-
-    pitches = 0
+    pitches = fb_n = swings = whiffs = called = 0
     fb_sum = 0.0
-    fb_n = 0
-    swings = 0
-    whiffs = 0
-    called = 0
-    wstr = 0
-    for row in rows[1:]:
+    for row in rows:
         desc = g(row, "description")
         if not desc:
             continue
@@ -114,10 +99,8 @@ def aggregate(text):
             swings += 1
         if desc in WHIFF_DESC:
             whiffs += 1
-            wstr += 1
         if desc == CALLED:
             called += 1
-
     if pitches == 0:
         return None
     out = {"pitches": pitches}
@@ -125,19 +108,43 @@ def aggregate(text):
         out["veloFb"] = round(fb_sum / fb_n, 1)
     if swings > 0:
         out["whiff"] = round(100.0 * whiffs / swings, 1)
-    out["csw"] = round(100.0 * (called + wstr) / pitches, 1)
+    out["csw"] = round(100.0 * (called + whiffs) / pitches, 1)
     return out
 
 
-def fetch_agg(url, tag):
+def process(pid):
+    """One bounded fetch -> baseline (prior) + recent (last L30) buckets."""
     for attempt in range(3):
         try:
-            return aggregate(fetch_csv(url))
+            rows = list(csv.reader(io.StringIO(fetch_csv(statcast_url(pid)))))
+            if not rows:
+                return None
+            idx = {k.strip(): i for i, k in enumerate(rows[0])}
+            if "description" not in idx or "release_speed" not in idx or "game_date" not in idx:
+                return None
+            gd = idx["game_date"]
+            body = rows[1:]
+            recent_rows = [r for r in body if len(r) > gd and r[gd].strip() >= L30_CUT]
+            base_rows   = [r for r in body if len(r) > gd and r[gd].strip() <  L30_CUT]
+            base = agg(base_rows, idx)
+            rec  = agg(recent_rows, idx)
+            out = {}
+            if base and base.get("pitches", 0) >= MIN_BASE_PITCH:
+                for k in ("veloFb", "whiff", "csw"):
+                    if k in base:
+                        out[k] = base[k]
+                out["pitches"] = base["pitches"]
+            if rec and rec.get("pitches", 0) >= MIN_L30_PITCH:
+                if "veloFb" in rec: out["veloFb_l30"] = rec["veloFb"]
+                if "whiff" in rec:  out["whiff_l30"]  = rec["whiff"]
+                if "csw" in rec:    out["csw_l30"]    = rec["csw"]
+                out["pitches_l30"] = rec["pitches"]
+            return out or None
         except Exception as e:                          # noqa: BLE001
             if attempt == 2:
-                print("  ! %s: %s" % (tag, e), file=sys.stderr)
+                print("  ! %s: %s" % (pid, e), file=sys.stderr)
                 return None
-            time.sleep(0.8 * (attempt + 1))
+            time.sleep(1.0 * (attempt + 1))
     return None
 
 
@@ -148,65 +155,38 @@ def main():
     with open(IDS_FILE, "r", encoding="utf-8") as fh:
         ids = list(json.load(fh).keys())
 
+    print("pitchers: %d | baseline %s..%s | recent last %dd | workers=%d"
+          % (len(ids), BASE_FROM, L30_CUT, L30_DAYS, WORKERS))
+
     data = {}
-    if os.path.exists(OUT_FILE):
-        try:
-            with open(OUT_FILE, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
-            data = {}
-
-    jobs = []
-    for pid in ids:
-        cur = data.get(pid) or {}
-        need_season = FORCE or cur.get("csw") is None
-        need_l30 = FORCE or cur.get("csw_l30") is None
-        if need_season or need_l30:
-            jobs.append(pid)
-
-    print("pitchers: %d | to enrich: %d | season %s | L30 %s..%s"
-          % (len(ids), len(jobs), YEAR, L30_FROM, L30_TO))
-
     filled = [0]
-    filled30 = [0]
+    filled_l30 = [0]
 
     def work(pid):
-        cur = data.get(pid) or {}
-        # season
-        if FORCE or cur.get("csw") is None:
-            ov = fetch_agg(statcast_url(pid), "%s season" % pid)
-            if ov:
-                for k in ("veloFb", "whiff", "csw", "pitches"):
-                    if k in ov:
-                        cur[k] = ov[k]
+        ov = process(pid)
+        if ov:
+            data[pid] = ov
+            if ov.get("veloFb") is not None or ov.get("whiff") is not None:
                 filled[0] += 1
-        # last-30-days
-        if FORCE or cur.get("csw_l30") is None:
-            ov = fetch_agg(statcast_url(pid, L30_FROM, L30_TO), "%s L30" % pid)
-            if ov and ov.get("pitches", 0) >= L30_MIN_PITCH:
-                if "veloFb" in ov:
-                    cur["veloFb_l30"] = ov["veloFb"]
-                if "whiff" in ov:
-                    cur["whiff_l30"] = ov["whiff"]
-                if "csw" in ov:
-                    cur["csw_l30"] = ov["csw"]
-                cur["pitches_l30"] = ov["pitches"]
-                filled30[0] += 1
-        if cur:
-            data[pid] = cur
+            if ov.get("veloFb_l30") is not None or ov.get("whiff_l30") is not None:
+                filled_l30[0] += 1
 
     done = 0
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        for _ in ex.map(work, jobs):
+        for _ in ex.map(work, ids):
             done += 1
-            if done % 40 == 0:
-                print("  ...%d/%d (%d season, %d L30)"
-                      % (done, len(jobs), filled[0], filled30[0]))
+            if done % 60 == 0:
+                print("  ...%d/%d (%d base, %d recent)"
+                      % (done, len(ids), filled[0], filled_l30[0]))
+
+    if not data:
+        print("ERROR: no pitchers parsed; leaving existing file untouched")
+        sys.exit(1)
 
     with open(OUT_FILE, "w", encoding="utf-8") as fh:
         json.dump(data, fh, separators=(",", ":"))
-    print("Done. Season filled %d, L30 filled %d. Wrote %s (%d pitchers)."
-          % (filled[0], filled30[0], OUT_FILE, len(data)))
+    print("WROTE %s: %d pitchers | %d with baseline velo/whiff | %d with recent(L30)"
+          % (OUT_FILE, len(data), filled[0], filled_l30[0]))
 
 
 if __name__ == "__main__":
