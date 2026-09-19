@@ -2,7 +2,7 @@
 """
 build_hand_splits.py
 Generates batter_hand_splits.json for the cushplayerprops board.
-
+ 
 Output shape (keyed by MLB player id):
 {
   "665742": {
@@ -11,33 +11,33 @@ Output shape (keyed by MLB player id):
   },
   ...
 }
-
+ 
 Formulas match the app exactly (parseHitterStat):
   wrcPlus = round((OPS / 0.720) * 100)
   iso     = SLG - AVG            (3 decimals, e.g. "0.255")
   kPct    = SO  / PA * 100       (1 decimal)
   bbPct   = BB  / PA * 100       (1 decimal)
-
+ 
 No API key needed. The MLB Stats API is public.
 """
-
+ 
 import json
 import time
 import urllib.request
-
+ 
 # NOTE: the last-N recency split now lives in build_hitter_ewma.py (hitter_recent.json,
 # real last-40-PA per hand from Baseball Savant). This file only builds the season
 # vs-LHP / vs-RHP splits. The old R30 statSplits date-range attempt was removed because
 # the MLB API ignores startDate/endDate on statSplits (it returned the full-season line),
 # so it just burned one extra API call per hitter for a duplicate of the season R split.
-
+ 
 SEASON = 2026
 BASE = "https://statsapi.mlb.com/api/v1"
 MIN_PA = 1          # raise this (e.g. 25) if you want to ignore tiny vs-hand samples
 SLEEP = 0.04        # be gentle on the API between calls
 OUT_FILE = "batter_hand_splits.json"
-
-
+ 
+ 
 def get(url, tries=3):
     for _ in range(tries):
         try:
@@ -46,23 +46,50 @@ def get(url, tries=3):
         except Exception:
             time.sleep(1)
     return {}
-
-
-def parse(stat):
-    """Replicates the app's parseHitterStat for the fields the columns use."""
-    if not stat:
-        return None
+ 
+ 
+def _num(st, key):
     try:
-        pa = int(stat.get("plateAppearances") or 0)
+        return int(st.get(key) or 0)
     except (TypeError, ValueError):
-        pa = 0
-    if pa < MIN_PA:
+        return 0
+ 
+ 
+def parse_combined(stat_list):
+    """Combine one or more team-stint stat dicts into a single season vs-hand
+    line, then compute the same fields as the app's parseHitterStat.
+ 
+    Traded players return one statSplits entry PER TEAM. The old code used only
+    splits[0] (one team), which undercounted traded hitters (e.g. Jo Adell
+    showing 41 PA vs LHP instead of his true two-team 171). We now sum the raw
+    counting stats across every team stint and recompute the rate stats, so the
+    vs-hand line reflects the full season regardless of trades. Non-traded
+    players simply have a single entry, so this is a no-op for them."""
+    pa = ab = h = bb = so = hbp = sf = d2 = t3 = hr = 0
+    for st in stat_list:
+        if not st:
+            continue
+        p = _num(st, "plateAppearances")
+        if p <= 0:
+            continue
+        pa += p
+        ab += _num(st, "atBats")
+        h += _num(st, "hits")
+        bb += _num(st, "baseOnBalls")
+        so += _num(st, "strikeOuts")
+        hbp += _num(st, "hitByPitch")
+        sf += _num(st, "sacFlies")
+        d2 += _num(st, "doubles")
+        t3 += _num(st, "triples")
+        hr += _num(st, "homeRuns")
+    if pa < MIN_PA or ab <= 0:
         return None
-    avg = float(stat.get("avg") or 0)
-    slg = float(stat.get("slg") or 0)
-    ops = float(stat.get("ops") or 0)
-    so = int(stat.get("strikeOuts") or 0)
-    bb = int(stat.get("baseOnBalls") or 0)
+    tb = h + d2 + 2 * t3 + 3 * hr            # H + 2B + 2*3B + 3*HR
+    avg = h / ab
+    slg = tb / ab
+    obp_den = ab + bb + hbp + sf
+    obp = (h + bb + hbp) / obp_den if obp_den else 0.0
+    ops = obp + slg
     return {
         "wrcPlus": round((ops / 0.720) * 100) if ops > 0 else None,
         "iso": f"{slg - avg:.3f}",
@@ -70,25 +97,29 @@ def parse(stat):
         "bbPct": f"{bb / pa * 100:.1f}",
         "pa": pa,
     }
-
-
+ 
+ 
 def fetch_split(pid, code):
     url = (f"{BASE}/people/{pid}/stats?stats=statSplits&group=hitting"
            f"&season={SEASON}&gameType=R&sitCodes={code}")
     j = get(url)
     try:
-        stat = j["stats"][0]["splits"][0]["stat"]
+        splits = j["stats"][0]["splits"]
     except (KeyError, IndexError, TypeError):
         return None
-    return parse(stat)
-
-
+    if not splits:
+        return None
+    # Combine every team stint (traded players return one entry per team)
+    # instead of taking only the first team's line.
+    return parse_combined([s.get("stat") or {} for s in splits])
+ 
+ 
 def main():
     # 1) every MLB team id
     teams = get(f"{BASE}/teams?sportId=1&season={SEASON}").get("teams", [])
     team_ids = [t["id"] for t in teams]
     print(f"{len(team_ids)} teams")
-
+ 
     # 2) collect hitter ids from active rosters (skip pitchers)
     hitter_ids = set()
     for tid in team_ids:
@@ -99,7 +130,7 @@ def main():
                 hitter_ids.add(p["person"]["id"])
         time.sleep(SLEEP)
     print(f"{len(hitter_ids)} hitters to fetch")
-
+ 
     # 3) per hitter: vs LHP (vl, season) and vs RHP (vr, season)
     out = {}
     for n, pid in enumerate(sorted(hitter_ids), 1):
@@ -110,12 +141,12 @@ def main():
         if n % 50 == 0:
             print(f"  {n}/{len(hitter_ids)}")
         time.sleep(SLEEP)
-
+ 
     # 4) write the feed
     with open(OUT_FILE, "w") as f:
         json.dump(out, f, separators=(",", ":"))
     print(f"wrote {OUT_FILE} with {len(out)} hitters")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
