@@ -112,12 +112,12 @@ def dash(extra):
     return p
 
 
-def logs_params():
+def logs_params(season_type="Regular Season"):
     return {
         "DateFrom": "", "DateTo": "", "GameSegment": "", "ISTRound": "", "LastNGames": "0",
         "LeagueID": LEAGUE, "Location": "", "MeasureType": "Base", "Month": "0",
         "OppTeamID": "0", "Outcome": "", "PORound": "0", "PerMode": "Totals", "Period": "0",
-        "PlayerID": "", "Season": SEASON, "SeasonSegment": "", "SeasonType": "Regular Season",
+        "PlayerID": "", "Season": SEASON, "SeasonSegment": "", "SeasonType": season_type,
         "ShotClockRange": "", "TeamID": "0", "VsConference": "", "VsDivision": "",
     }
 
@@ -558,9 +558,13 @@ def main():
 
     # Per-game logs (recent games) -> powers L10 hit-rate + out/usage flags.
     # PerMode=Totals gives each game's actual raw stat line.
-    def ingest_logs(js):
+    def ingest_logs(*jslist):
         tmp = {}
-        for r in rows(js):
+        _allrows = []
+        for _js in jslist:
+            if _js is not None:
+                _allrows.extend(rows(_js))
+        for r in _allrows:
             pid = r.get("PLAYER_ID")
             if pid is None:
                 continue
@@ -618,7 +622,14 @@ def main():
                 players[pid] = {"id": pid, "log": recent}
 
     try:
-        ingest_logs(get("/playergamelogs", logs_params()))
+        _reg_logs = get("/playergamelogs", logs_params("Regular Season"))
+        _po_logs = None
+        try:
+            _po_logs = get("/playergamelogs", logs_params("Playoffs"))
+        except Exception as _e2:
+            errors["gameLogsPlayoffs"] = str(_e2)
+        # Merge regular season + playoffs so recent-game logs (the L10 bars) include postseason.
+        ingest_logs(_reg_logs, _po_logs)
     except Exception as e:
         errors["gameLogs"] = str(e)
 
@@ -719,6 +730,79 @@ def main():
                     del _t[_zk + "_l10"]     # drop the temp key so it doesn't bloat the feed
     except Exception as e:
         errors["teamZoneDefL10"] = str(e)
+
+    # ---- PLAYOFF BLEND: fold postseason into the CUSH matchup drivers by games played ----
+    # Player shot zones, team defense zones, and opponent style (oppAstRate) get a games-weighted
+    # postseason component so CUSH / the tier matchups reflect playoff form. The L10 game-log bars
+    # and the defense-vs-position allowances already include playoffs via the merged logs above.
+    # Graceful: if there are no playoff games yet, every block below is skipped (pure regular season).
+    try:
+        _po_pgp, _po_tgp = {}, {}
+        try:
+            for r in rows(get("/leaguedashplayerstats", dash({"LastNGames": "0", "SeasonType": "Playoffs"}))):
+                _id = r.get("PLAYER_ID")
+                if _id is not None:
+                    _po_pgp[_id] = num(r.get("GP")) or 0
+        except Exception as _e:
+            errors["playoffPlayerGP"] = str(_e)
+        try:
+            for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Base", "SeasonType": "Playoffs"}))):
+                _id = r.get("TEAM_ID")
+                if _id is not None:
+                    _po_tgp[_id] = num(r.get("GP")) or 0
+        except Exception as _e:
+            errors["playoffTeamGP"] = str(_e)
+        # player shot zones
+        if any(v > 0 for v in _po_pgp.values()):
+            ingest_zones(get("/leaguedashplayershotlocations",
+                             dash({"DistanceRange": "By Zone", "SeasonType": "Playoffs"})), "_po")
+            for _p in players.values():
+                _rg = _p.get("gp") or 0
+                _pg = _po_pgp.get(_p.get("id")) or 0
+                if _pg > 0 and (_rg + _pg) > 0:
+                    for _zk in _PZONE_KEYS:
+                        _s, _v = _p.get(_zk), _p.get(_zk + "_po")
+                        if _s is not None and _v is not None:
+                            _p[_zk] = round((_s * _rg + _v * _pg) / (_rg + _pg), 3)
+                for _zk in _PZONE_KEYS:
+                    if (_zk + "_po") in _p:
+                        del _p[_zk + "_po"]
+        # team defense zones + opponent style rate
+        if any(v > 0 for v in _po_tgp.values()):
+            ingest_team_zones(get("/leaguedashteamshotlocations",
+                                  dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "SeasonType": "Playoffs"})), "_po")
+            _po_opp = {}
+            try:
+                for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent", "SeasonType": "Playoffs"}))):
+                    _id = r.get("TEAM_ID")
+                    _oa, _of = r.get("OPP_AST"), r.get("OPP_FGM")
+                    try:
+                        _oar = round(float(_oa) / float(_of), 3) if (_oa not in (None, "") and _of not in (None, "", 0)) else None
+                    except Exception:
+                        _oar = None
+                    _po_opp[_id] = {"oppAstRate": _oar, "oppFg3a": num(r.get("OPP_FG3A")),
+                                    "oppFg3Pct": num(r.get("OPP_FG3_PCT")), "oppFta": num(r.get("OPP_FTA"))}
+            except Exception as _e:
+                errors["playoffOpp"] = str(_e)
+            for _t in teams.values():
+                _rg = _t.get("gp") or 0
+                _pg = _po_tgp.get(_t.get("id")) or 0
+                if _pg > 0 and (_rg + _pg) > 0:
+                    for _zk in _ZONE_KEYS:
+                        _s, _v = _t.get(_zk), _t.get(_zk + "_po")
+                        if _s is not None and _v is not None:
+                            _t[_zk] = round((_s * _rg + _v * _pg) / (_rg + _pg), 3)
+                    _d = _po_opp.get(_t.get("id"))
+                    if _d:
+                        for _k in ("oppAstRate", "oppFg3a", "oppFg3Pct", "oppFta"):
+                            _s, _v = _t.get(_k), _d.get(_k)
+                            if _s is not None and _v is not None:
+                                _t[_k] = round((_s * _rg + _v * _pg) / (_rg + _pg), 3)
+                for _zk in _ZONE_KEYS:
+                    if (_zk + "_po") in _t:
+                        del _t[_zk + "_po"]
+    except Exception as e:
+        errors["playoffZoneBlend"] = str(e)
 
     # attach defense-vs-position per-game allowances (G/F/C) to each team
     abbr2id = {v: k for k, v in id2abbr.items()}
