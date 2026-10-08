@@ -790,7 +790,7 @@ def main():
             # defending NOW (playoffs included) -- a team that has started leaking 3s in the
             # postseason flips toward "gives it up" even if its season-long zone D was stingy.
             # Tunable via WNBA_DEF_NWIN (smaller window = heavier weight on the recent playoff games).
-            _NWIN = int(os.environ.get("WNBA_DEF_NWIN", "10"))
+            _NWIN = int(os.environ.get("WNBA_DEF_NWIN", "6"))
             for _t in teams.values():
                 _pg = min(_NWIN, _po_tgp.get(_t.get("id")) or 0)
                 _rg = max(0, _NWIN - _pg)
