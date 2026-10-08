@@ -770,10 +770,10 @@ def main():
         # team defense zones + opponent style rate
         if any(v > 0 for v in _po_tgp.values()):
             ingest_team_zones(get("/leaguedashteamshotlocations",
-                                  dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "SeasonType": "Playoffs"})), "_po")
+                                  dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "SeasonType": "Playoffs", "LastNGames": "10"})), "_po")
             _po_opp = {}
             try:
-                for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent", "SeasonType": "Playoffs"}))):
+                for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent", "SeasonType": "Playoffs", "LastNGames": "10"}))):
                     _id = r.get("TEAM_ID")
                     _oa, _of = r.get("OPP_AST"), r.get("OPP_FGM")
                     try:
@@ -784,27 +784,23 @@ def main():
                                     "oppFg3Pct": num(r.get("OPP_FG3_PCT")), "oppFta": num(r.get("OPP_FTA"))}
             except Exception as _e:
                 errors["playoffOpp"] = str(_e)
-            # RECENT-FORM WINDOW: weight the postseason by its games played and fill the rest of a
-            # last-N-games window with recent regular-season form, instead of diluting the playoffs
-            # by the full-season GP. This makes the opponent-defense zones reflect how a team is
-            # defending NOW (playoffs included) -- a team that has started leaking 3s in the
-            # postseason flips toward "gives it up" even if its season-long zone D was stingy.
-            # Tunable via WNBA_DEF_NWIN (smaller window = heavier weight on the recent playoff games).
-            _NWIN = int(os.environ.get("WNBA_DEF_NWIN", "6"))
+            # STRAIGHT RECENT FORM (no season blend): once the postseason starts, a team's recent
+            # games ARE the playoffs, so the opponent-defense zones use the playoff numbers directly
+            # (last 10 playoff games). This is "just L10" -- the defense reflects how a team is
+            # defending right now, not a season-long average that buries a recent collapse or hot
+            # streak. Teams not in the playoffs keep their L10 regular-season defense. No blending.
             for _t in teams.values():
-                _pg = min(_NWIN, _po_tgp.get(_t.get("id")) or 0)
-                _rg = max(0, _NWIN - _pg)
-                if _pg > 0 and (_rg + _pg) > 0:
+                if (_po_tgp.get(_t.get("id")) or 0) > 0:
                     for _zk in _ZONE_KEYS:
-                        _s, _v = _t.get(_zk), _t.get(_zk + "_po")
-                        if _s is not None and _v is not None:
-                            _t[_zk] = round((_s * _rg + _v * _pg) / (_rg + _pg), 3)
+                        _v = _t.get(_zk + "_po")
+                        if _v is not None:
+                            _t[_zk] = _v
                     _d = _po_opp.get(_t.get("id"))
                     if _d:
                         for _k in ("oppAstRate", "oppFg3a", "oppFg3Pct", "oppFta"):
-                            _s, _v = _t.get(_k), _d.get(_k)
-                            if _s is not None and _v is not None:
-                                _t[_k] = round((_s * _rg + _v * _pg) / (_rg + _pg), 3)
+                            _v = _d.get(_k)
+                            if _v is not None:
+                                _t[_k] = _v
                 for _zk in _ZONE_KEYS:
                     if (_zk + "_po") in _t:
                         del _t[_zk + "_po"]
