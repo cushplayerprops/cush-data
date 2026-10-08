@@ -916,6 +916,49 @@ def main():
                     _pl["injDetail"] = _st["detail"]
                 inj_matched += 1
 
+    # SYNERGY PLAY TYPES -> points by play type (offense, per player) + team defense by play type.
+    # Powers the play-type donut (Catch & Shoot / Driving / Off-Rebound / Cut / Other) and the
+    # "D v PLAY" ranks. Stored as RAW per-play-type values so the app does the 5-bucket mapping
+    # (tunable in-app without a data rebuild). Fully defensive: any failure just omits the data and
+    # the donut hides. WNBA season year is the single-year form (e.g. "2026").
+    SYN_TYPES = ["Spotup", "OffScreen", "Transition", "Isolation", "PRBallHandler", "OffRebound", "Cut", "Handoff", "Postup", "PRRollman", "Misc"]
+
+    def syn_params(play_type, grouping, por):
+        return {
+            "LeagueID": LEAGUE, "PerMode": "PerGame", "PlayType": play_type,
+            "PlayerOrTeam": por, "SeasonType": "Regular Season", "SeasonYear": SEASON,
+            "TypeGrouping": grouping,
+        }
+
+    def ingest_syn_off(pt, js):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            v = num(r.get("PTS"))
+            if v is not None:
+                players[pid].setdefault("syn", {})[pt] = v
+
+    def ingest_syn_def(pt, js):
+        for r in rows(js):
+            tid = r.get("TEAM_ID")
+            if tid is None or tid not in teams:
+                continue
+            teams[tid].setdefault("synDef", {})[pt] = {
+                "pts": num(r.get("PTS")), "poss": num(r.get("POSS")), "ppp": num(r.get("PPP")),
+            }
+
+    for _pt in SYN_TYPES:
+        try:
+            ingest_syn_off(_pt, get("/synergyplaytypes", syn_params(_pt, "offensive", "P")))
+        except Exception as _e:
+            errors["synOff_" + _pt] = str(_e)
+    for _pt in SYN_TYPES:
+        try:
+            ingest_syn_def(_pt, get("/synergyplaytypes", syn_params(_pt, "defensive", "T")))
+        except Exception as _e:
+            errors["synDef_" + _pt] = str(_e)
+
     out = {
         "updated": datetime.datetime.utcnow().isoformat() + "Z",
         "season": SEASON, "gameDate": game_date,
