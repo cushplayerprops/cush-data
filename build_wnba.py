@@ -916,83 +916,69 @@ def main():
                     _pl["injDetail"] = _st["detail"]
                 inj_matched += 1
 
-    # SYNERGY PLAY TYPES -> points by play type (offense, per player) + team defense by play type.
-    # Powers the play-type donut (Catch & Shoot / Driving / Off-Rebound / Cut / Other) and the
-    # "D v PLAY" ranks. Stored as RAW per-play-type values so the app does the 5-bucket mapping
-    # (tunable in-app without a data rebuild). Fully defensive: any failure just omits the data and
-    # the donut hides. WNBA season year is the single-year form (e.g. "2026").
-    SYN_TYPES = ["Spotup", "OffScreen", "Transition", "Isolation", "PRBallHandler", "OffRebound", "Cut", "Handoff", "Postup", "PRRollman", "Misc"]
-
-    def syn_params(play_type, grouping, por):
-        return {
-            "LeagueID": LEAGUE, "PerMode": "PerGame", "PlayType": play_type,
-            "PlayerOrTeam": por, "SeasonType": "Regular Season", "SeasonYear": SEASON,
-            "TypeGrouping": grouping,
-        }
-
-    def ingest_syn_off(pt, js):
+    # PLAY-TYPE SCORING from WNBA player TRACKING. (Synergy play-types are NOT served for the WNBA
+    # publicly -- the /synergyplaytypes endpoint returns the schema but an empty resultSet for every
+    # season/type -- so we build the "how she scores" mix from tracking instead.) Catch & Shoot pts
+    # and Driving pts come from leaguedashptstats; second-chance pts (off the offensive glass) from
+    # leaguedashplayerstats Misc. "Other" is derived in the app as total scoring minus these. The
+    # per-play-type defensive matchup ("D v PLAY") is also derived in the app from our existing zone
+    # + opponent defense (3-pt D for catch&shoot, rim/paint D for driving, rebounds-allowed for
+    # off-rebound), since play-type DEFENSE is likewise a Synergy-only stat for the WNBA.
+    def ingest_catchshoot(js):
         for r in rows(js):
             pid = r.get("PLAYER_ID")
-            if pid is None or pid not in players:
-                continue
-            v = num(r.get("PTS"))
-            if v is not None:
-                players[pid].setdefault("syn", {})[pt] = v
+            if pid is not None and pid in players:
+                players[pid]["ptCS"] = num(r.get("CATCH_SHOOT_PTS"))
 
-    def ingest_syn_def(pt, js):
+    def ingest_drives(js):
         for r in rows(js):
-            tid = r.get("TEAM_ID")
-            if tid is None or tid not in teams:
-                continue
-            teams[tid].setdefault("synDef", {})[pt] = {
-                "pts": num(r.get("PTS")), "poss": num(r.get("POSS")), "ppp": num(r.get("PPP")),
-            }
+            pid = r.get("PLAYER_ID")
+            if pid is not None and pid in players:
+                players[pid]["ptDrive"] = num(r.get("DRIVE_PTS"))
 
-    # one-shot PARAM SWEEP: synergy endpoint + fields are confirmed correct; find the param combo
-    # that actually returns rows for WNBA (season year / season type / per-mode).
-    syn_debug = {}
-    def _syn_rowcount(params):
-        try:
-            js = get("/synergyplaytypes", params)
-            rs = (js or {}).get("resultSets") or []
-            if not rs:
-                return "no-rs"
-            rc = len(rs[0].get("rowSet") or [])
-            fr = (rs[0].get("rowSet") or [None])[0]
-            return {"rows": rc, "sample": fr[:12] if fr else None}
-        except Exception as _e:
-            return "ERR:" + str(_e)[:60]
-    _base = {"LeagueID": LEAGUE, "PlayType": "Spotup", "PlayerOrTeam": "P", "TypeGrouping": "offensive"}
-    _combos = {
-        "2026_reg_pg":  dict(_base, SeasonYear="2026", SeasonType="Regular Season", PerMode="PerGame"),
-        "2026_po_pg":   dict(_base, SeasonYear="2026", SeasonType="Playoffs",       PerMode="PerGame"),
-        "2025_reg_pg":  dict(_base, SeasonYear="2025", SeasonType="Regular Season", PerMode="PerGame"),
-        "2025_po_pg":   dict(_base, SeasonYear="2025", SeasonType="Playoffs",       PerMode="PerGame"),
-        "2026_reg_tot": dict(_base, SeasonYear="2026", SeasonType="Regular Season", PerMode="Totals"),
-        "2026_reg_season": dict(_base, Season="2026", SeasonType="Regular Season", PerMode="PerGame"),
-    }
-    for _lbl, _pp in _combos.items():
-        syn_debug[_lbl] = _syn_rowcount(_pp)
+    def ingest_misc(js):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is not None and pid in players:
+                players[pid]["pt2nd"] = num(r.get("PTS_2ND_CHANCE"))
 
-    for _pt in SYN_TYPES:
-        try:
-            ingest_syn_off(_pt, get("/synergyplaytypes", syn_params(_pt, "offensive", "P")))
-        except Exception as _e:
-            errors["synOff_" + _pt] = str(_e)
-    for _pt in SYN_TYPES:
-        try:
-            ingest_syn_def(_pt, get("/synergyplaytypes", syn_params(_pt, "defensive", "T")))
-        except Exception as _e:
-            errors["synDef_" + _pt] = str(_e)
-
+    pt_debug = {}
+    try:
+        _cs = get("/leaguedashptstats", ptparams("CatchShoot"))
+        _rs = (_cs or {}).get("resultSets") or []
+        if _rs:
+            pt_debug["csHeaders"] = _rs[0].get("headers")
+            pt_debug["csRows"] = len(_rs[0].get("rowSet") or [])
+            _fr = (_rs[0].get("rowSet") or [None])[0]
+            pt_debug["csFirst"] = _fr[:18] if _fr else None
+        ingest_catchshoot(_cs)
+    except Exception as _e:
+        errors["ptCatchShoot"] = str(_e)
+    try:
+        _dr = get("/leaguedashptstats", ptparams("Drives"))
+        _rsd = (_dr or {}).get("resultSets") or []
+        if _rsd:
+            pt_debug["drHeaders"] = _rsd[0].get("headers")
+            pt_debug["drRows"] = len(_rsd[0].get("rowSet") or [])
+        ingest_drives(_dr)
+    except Exception as _e:
+        errors["ptDrives"] = str(_e)
+    try:
+        _ms = get("/leaguedashplayerstats", dash({"MeasureType": "Misc"}))
+        _rsm = (_ms or {}).get("resultSets") or []
+        if _rsm:
+            pt_debug["miscHas2nd"] = ("PTS_2ND_CHANCE" in (_rsm[0].get("headers") or []))
+        ingest_misc(_ms)
+    except Exception as _e:
+        errors["ptMisc"] = str(_e)
     out = {
         "updated": datetime.datetime.utcnow().isoformat() + "Z",
         "season": SEASON, "gameDate": game_date,
         "counts": {"games": len(games), "players": len(players), "teams": len(teams), "injListed": len(inj_map), "injMatched": inj_matched, "posMatched": sum(1 for p in players.values() if p.get("pos")), "dvpTeams": sum(1 for t in teams.values() if t.get("dvp"))},
         "games": games, "teams": teams, "players": players,
     }
-    if syn_debug:
-        out["synDebug"] = syn_debug
+    if pt_debug:
+        out["ptDebug"] = pt_debug
     if errors:
         out["errors"] = errors
 
