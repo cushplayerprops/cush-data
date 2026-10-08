@@ -1,0 +1,1066 @@
+#!/usr/bin/env python3
+"""
+build_nba.py - NBA feed for cushplayerprops.win. Schedule + player
+3PA/FGA/PTS/MIN + shot zones + assisted rate + per-game logs + team pace +
+opponent defense (totals, FT-allowed, AND by-zone) + player free throws from stats.nba.com. Runs from GitHub
+Actions via the ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY secret).
+Requires: pip install requests
+"""
+
+import os, json, time, datetime, re, unicodedata
+import requests
+from urllib.parse import urlencode
+
+SEASON = os.environ.get("NBA_SEASON") or "2025-26"
+LEAGUE = "00"
+STYPE  = os.environ.get("NBA_SEASON_TYPE") or "Regular Season"  # "Pre Season" to test now, "Regular Season" live
+OUT    = os.environ.get("OUT", "nba_stats.json")
+BASE   = "https://stats.nba.com/stats"
+
+SCRAPEOPS_KEY = os.environ.get("SCRAPEOPS_API_KEY", "")
+PROXY = "https://proxy.scrapeops.io/v1/"
+ESPN_INJ = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nba.com/",
+    "Origin": "https://www.nba.com",
+    "x-nba-stats-origin": "stats",
+    "x-nba-stats-token": "true",
+    "Connection": "keep-alive",
+}
+
+
+def get(path, params, tries=4):
+    target = BASE + path + "?" + urlencode(params)
+    proxy_payload = {"api_key": SCRAPEOPS_KEY, "url": target, "residential": "true", "keep_headers": "true"}
+    proxy_url = PROXY + "?" + urlencode(proxy_payload)
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(proxy_url, headers=HEADERS, timeout=130)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            print(f"  retry {i+1}/{tries} for {path}: {e}")
+            time.sleep(3 + i * 3)
+    raise last
+
+
+def rows(js, name=None):
+    rs = (js or {}).get("resultSets") or []
+    st = None
+    if name:
+        for x in rs:
+            if x.get("name") == name:
+                st = x; break
+    else:
+        st = rs[0] if rs else None
+    if not st:
+        return []
+    H = st["headers"]
+    return [dict(zip(H, row)) for row in st.get("rowSet", [])]
+
+
+def shot_zone_rows(js):
+    rs = (js or {}).get("resultSets") or {}
+    if isinstance(rs, list):
+        rs = rs[0] if rs else {}
+    hdrs = rs.get("headers") or []
+    zone_names, flat, skip = [], [], 5
+    for h in hdrs:
+        cn = h.get("columnNames") or []
+        if "PLAYER_ID" in cn or "TEAM_ID" in cn:
+            flat = cn
+        else:
+            zone_names = cn
+        if h.get("columnsToSkip") is not None:
+            skip = h.get("columnsToSkip")
+    if not flat:
+        return []
+    out = []
+    for row in rs.get("rowSet", []):
+        d = {}
+        for i in range(min(skip, len(flat), len(row))):
+            d[flat[i]] = row[i]
+        idx = skip
+        for z in zone_names:
+            for stat in ("FGM", "FGA", "FG_PCT"):
+                if idx < len(row):
+                    d[f"{z}|{stat}"] = row[idx]
+                idx += 1
+        out.append(d)
+    return out
+
+
+def dash(extra):
+    p = {
+        "College": "", "Conference": "", "Country": "", "DateFrom": "", "DateTo": "",
+        "Division": "", "DraftPick": "", "DraftYear": "", "GameScope": "", "GameSegment": "",
+        "Height": "", "LastNGames": "0", "LeagueID": LEAGUE, "Location": "",
+        "MeasureType": "Base", "Month": "0", "OpponentTeamID": "0", "Outcome": "",
+        "PORound": "0", "PaceAdjust": "N", "PerMode": "PerGame", "Period": "0",
+        "PlayerExperience": "", "PlayerPosition": "", "PlusMinus": "N", "Rank": "N",
+        "Season": SEASON, "SeasonSegment": "", "SeasonType": STYPE,
+        "ShotClockRange": "", "StarterBench": "", "TeamID": "0", "VsConference": "",
+        "VsDivision": "", "Weight": "",
+    }
+    p.update(extra)
+    return p
+
+
+def logs_params(season_type=None):
+    season_type = season_type or STYPE
+    return {
+        "DateFrom": "", "DateTo": "", "GameSegment": "", "ISTRound": "", "LastNGames": "0",
+        "LeagueID": LEAGUE, "Location": "", "MeasureType": "Base", "Month": "0",
+        "OppTeamID": "0", "Outcome": "", "PORound": "0", "PerMode": "Totals", "Period": "0",
+        "PlayerID": "", "Season": SEASON, "SeasonSegment": "", "SeasonType": season_type,
+        "ShotClockRange": "", "TeamID": "0", "VsConference": "", "VsDivision": "",
+    }
+
+
+def et_date():
+    import zoneinfo
+    now = datetime.datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+    return now.strftime("%m/%d/%Y")
+
+
+def pbnorm(s):
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.lower()
+    s = s.replace("'", "").replace("\u2019", "")
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def get_url(full_url, tries=4, residential=True):
+    payload = {"api_key": SCRAPEOPS_KEY, "url": full_url}
+    if residential:
+        payload["residential"] = "true"
+    proxy_url = PROXY + "?" + urlencode(payload)
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(proxy_url, timeout=130)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            print(f"  retry {i+1}/{tries} for proxied url: {e}")
+            time.sleep(3 + i * 3)
+    raise last
+
+
+def fetch_injuries_raw():
+    # ESPN site.api is public; try direct first (free), fall back to the ScrapeOps proxy.
+    try:
+        r = requests.get(ESPN_INJ, headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"}, timeout=30)
+        r.raise_for_status()
+        js = r.json()
+        if (js or {}).get("injuries"):
+            return js
+        print("  injuries direct returned no groups, trying proxy")
+    except Exception as e:
+        print("  injuries direct failed, trying proxy:", e)
+    return get_url(ESPN_INJ)
+
+
+def classify_injury(detail, it):
+    """WNBA feed's top-level 'status' AND type field are coarse -- both read 'Out'
+    even for questionable/day-to-day players. The beat-writer comment is the one field
+    that reliably distinguishes them, so classify from it first, then fall back."""
+    dl = (detail or "").lower()
+    if "questionable" in dl:
+        return "Questionable"
+    if "doubtful" in dl:
+        return "Doubtful"
+    if ("day-to-day" in dl or "day to day" in dl or "game-time decision" in dl or "game time decision" in dl):
+        return "Day-To-Day"
+    if "probable" in dl and "improbable" not in dl:
+        return "Probable"
+    if re.search(r"\bout\b", dl) or any(kw in dl for kw in (
+            "will miss", "sidelined", "re-evaluated", "reevaluated", "remainder of the season",
+            "won't return", "will not play", "won't play", "inactive", "did not return", "torn acl")):
+        return "Out"
+    # comment said nothing decisive -> fall back to the coarse type / status fields
+    typ = (it or {}).get("type") or {}
+    abbr = (typ.get("abbreviation") or "").upper().strip()
+    tname = (typ.get("name") or "").upper()
+    ABBR = {"O": "Out", "D": "Doubtful", "Q": "Questionable",
+            "DD": "Day-To-Day", "DTD": "Day-To-Day", "GTD": "Day-To-Day"}
+    if abbr in ABBR:
+        return ABBR[abbr]
+    if "QUESTION" in tname:
+        return "Questionable"
+    if "DOUBT" in tname:
+        return "Doubtful"
+    if "DAYTODAY" in tname or "DAY_TO_DAY" in tname:
+        return "Day-To-Day"
+    if "OUT" in tname:
+        return "Out"
+    return ((it or {}).get("status") or "").strip() or "Out"
+
+
+def parse_injuries(js):
+    res = {}
+    groups = (js or {}).get("injuries") or []
+    for grp in groups:
+        items = grp.get("injuries") if isinstance(grp, dict) else None
+        if items is None:
+            items = [grp]
+        for it in (items or []):
+            if not isinstance(it, dict):
+                continue
+            ath = it.get("athlete") or {}
+            nm = ath.get("displayName") or ath.get("fullName") or ath.get("shortName")
+            if not nm:
+                continue
+            detail = it.get("shortComment") or it.get("longComment") or ""
+            status = classify_injury(detail, it)
+            k = pbnorm(nm)
+            if k:
+                res[k] = {"status": status, "detail": (detail or "")[:180]}
+    return res
+
+
+def num(v):
+    if v is None or v == "":
+        return None
+    try:
+        return round(float(v), 3)
+    except Exception:
+        return None
+
+
+def main():
+    if not SCRAPEOPS_KEY:
+        print("WARNING: SCRAPEOPS_API_KEY not set -- requests will likely fail (403).")
+
+    errors = {}
+    game_date = os.environ.get("NBA_DATE", et_date())
+
+    # WNBA has few games per night, and PrizePicks/Underdog post lines a couple days out.
+    # Pull today + the next couple days so the board isn't empty and future-day props show.
+    def _date_list():
+        import zoneinfo
+        forced = os.environ.get("NBA_DATE")
+        days = int(os.environ.get("NBA_DAYS", "3"))
+        base = datetime.datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+        if forced:
+            try:
+                base = datetime.datetime.strptime(forced, "%m/%d/%Y")
+            except Exception:
+                pass
+            return [(base.strftime("%m/%d/%Y"), base.strftime("%a"))]
+        return [((base + datetime.timedelta(days=o)).strftime("%m/%d/%Y"),
+                 (base + datetime.timedelta(days=o)).strftime("%a")) for o in range(max(1, days))]
+
+    games, team_abbr = [], {}
+    seen_games = set()
+    for (gd, dow) in _date_list():
+        try:
+            sb = get("/scoreboardv2", {"DayOffset": "0", "GameDate": gd, "LeagueID": LEAGUE})
+            for r in rows(sb, "LineScore"):
+                if r.get("TEAM_ID") is not None:
+                    team_abbr[r["TEAM_ID"]] = r.get("TEAM_ABBREVIATION")
+            for g in rows(sb, "GameHeader"):
+                gid = g.get("GAME_ID")
+                if gid in seen_games:
+                    continue
+                seen_games.add(gid)
+                games.append({
+                    "gameId": gid, "status": g.get("GAME_STATUS_ID"),
+                    "statusText": (g.get("GAME_STATUS_TEXT") or "").strip(),
+                    "date": gd, "day": dow,
+                    "home": {"id": g.get("HOME_TEAM_ID"), "abbr": team_abbr.get(g.get("HOME_TEAM_ID"))},
+                    "away": {"id": g.get("VISITOR_TEAM_ID"), "abbr": team_abbr.get(g.get("VISITOR_TEAM_ID"))},
+                })
+        except Exception as e:
+            errors.setdefault("schedule", str(e))
+    # backfill any abbreviations that were missing when a future-date game was first seen
+    for g in games:
+        if g["home"]["abbr"] is None:
+            g["home"]["abbr"] = team_abbr.get(g["home"]["id"])
+        if g["away"]["abbr"] is None:
+            g["away"]["abbr"] = team_abbr.get(g["away"]["id"])
+
+    players = {}
+
+    def ingest(js, prefix):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None:
+                continue
+            p = players.setdefault(pid, {"id": pid, "name": r.get("PLAYER_NAME"),
+                "teamId": r.get("TEAM_ID"), "teamAbbr": r.get("TEAM_ABBREVIATION")})
+            p[prefix + "gp"] = num(r.get("GP"))
+            p[prefix + "min"] = num(r.get("MIN"))
+            p[prefix + "fga"] = num(r.get("FGA"))
+            p[prefix + "fg3a"] = num(r.get("FG3A"))
+            p[prefix + "pts"] = num(r.get("PTS"))
+            p[prefix + "ftm"] = num(r.get("FTM"))
+            p[prefix + "fta"] = num(r.get("FTA"))
+            p[prefix + "ftPct"] = num(r.get("FT_PCT"))
+            p[prefix + "reb"] = num(r.get("REB"))
+            p[prefix + "oreb"] = num(r.get("OREB"))   # offensive rebounds / game
+            p[prefix + "dreb"] = num(r.get("DREB"))   # defensive rebounds / game
+            p[prefix + "ast"] = num(r.get("AST"))
+            p[prefix + "stl"] = num(r.get("STL"))
+            p[prefix + "blk"] = num(r.get("BLK"))
+            p[prefix + "tov"] = num(r.get("TOV"))
+            p[prefix + "pf"] = num(r.get("PF"))       # personal fouls per game -> foul-trouble flag
+
+    try:
+        ingest(get("/leaguedashplayerstats", dash({"LastNGames": "0"})), "")
+    except Exception as e:
+        errors["playersSeason"] = str(e)
+    try:
+        ingest(get("/leaguedashplayerstats", dash({"LastNGames": "10"})), "r_")
+    except Exception as e:
+        errors["playersRecent"] = str(e)
+
+    # ADVANCED measure -> true on-court RATE stats (share of available boards / teammate makes,
+    # pace-independent). These are the "does the player actually convert the matchup" numbers.
+    def ingest_advanced(js, prefix=""):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            p = players[pid]
+            p[prefix + "orebPct"] = num(r.get("OREB_PCT"))   # % of available OREB grabbed on court
+            p[prefix + "drebPct"] = num(r.get("DREB_PCT"))   # % of available DREB grabbed on court
+            p[prefix + "rebPct"]  = num(r.get("REB_PCT"))
+            p[prefix + "astPct"]  = num(r.get("AST_PCT"))    # % of teammate FGM assisted on court
+            p[prefix + "usgPct"]  = num(r.get("USG_PCT"))
+    try:
+        ingest_advanced(get("/leaguedashplayerstats", dash({"MeasureType": "Advanced", "LastNGames": "0"})), "")
+    except Exception as e:
+        errors["advanced"] = str(e)
+    try:
+        ingest_advanced(get("/leaguedashplayerstats", dash({"MeasureType": "Advanced", "LastNGames": "10"})), "r_")
+    except Exception as e:
+        errors["advancedRecent"] = str(e)
+
+    # per-zone FG% = FGM/FGA (real makes over attempts), so the app's points/makes
+    # metrics (PTS/3PM/2PM) have a scoring-efficiency value per zone, not just attempts.
+    def _zpct(r, z):
+        fgm = num(r.get(z + "|FGM")); fga = num(r.get(z + "|FGA"))
+        if fgm is None or fga is None or fga <= 0:
+            return None
+        return round(fgm / fga, 3)
+
+    def _zpct2(r, za, zb):   # combined corner 3 (makes-weighted across L+R)
+        ma_, aa = num(r.get(za + "|FGM")), num(r.get(za + "|FGA"))
+        mb, ab = num(r.get(zb + "|FGM")), num(r.get(zb + "|FGA"))
+        tot_m = (ma_ or 0) + (mb or 0); tot_a = (aa or 0) + (ab or 0)
+        return round(tot_m / tot_a, 3) if tot_a > 0 else None
+
+    def ingest_zones(js, suffix=""):
+        for r in shot_zone_rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            p = players[pid]
+            g = lambda z: num(r.get(z + "|FGA"))
+            lc, rc = g("Left Corner 3"), g("Right Corner 3")
+            p["z_ra" + suffix] = g("Restricted Area")
+            p["z_paint" + suffix] = g("In The Paint (Non-RA)")
+            p["z_mid" + suffix] = g("Mid-Range")
+            p["z_corner3" + suffix] = round((lc or 0) + (rc or 0), 3)
+            p["z_above3" + suffix] = g("Above the Break 3")
+            p["z_ra_pct" + suffix] = _zpct(r, "Restricted Area")
+            p["z_paint_pct" + suffix] = _zpct(r, "In The Paint (Non-RA)")
+            p["z_mid_pct" + suffix] = _zpct(r, "Mid-Range")
+            p["z_corner3_pct" + suffix] = _zpct2(r, "Left Corner 3", "Right Corner 3")
+            p["z_above3_pct" + suffix] = _zpct(r, "Above the Break 3")
+
+    try:
+        ingest_zones(get("/leaguedashplayershotlocations", dash({"DistanceRange": "By Zone"})))
+    except Exception as e:
+        errors["shotZones"] = str(e)
+
+    # PLAYER shot zones are SEASON by default (a player's shot profile is a stable trait).
+    # Set NBA_PZONE_W > 0 to blend in a Last-10 recency component; 0 = pure season, no extra proxy call.
+    _PZONE_KEYS = ("z_ra", "z_paint", "z_mid", "z_corner3", "z_above3",
+                   "z_ra_pct", "z_paint_pct", "z_mid_pct", "z_corner3_pct", "z_above3_pct")
+    _PZW = float(os.environ.get("NBA_PZONE_W", "0.0"))
+    if _PZW > 0:
+        try:
+            ingest_zones(get("/leaguedashplayershotlocations",
+                             dash({"DistanceRange": "By Zone", "LastNGames": "10"})), "_l10")
+            _PZFULL = float(os.environ.get("NBA_DVP_FULL", "6"))
+            for _p in players.values():
+                _rg = _p.get("r_gp") or 0
+                _w = _PZW * min(1.0, (_rg / _PZFULL) if _PZFULL > 0 else 1.0)
+                for _zk in _PZONE_KEYS:
+                    _s = _p.get(_zk)
+                    _r = _p.get(_zk + "_l10")
+                    if _s is not None and _r is not None and _w > 0:
+                        _p[_zk] = round((1.0 - _w) * _s + _w * _r, 3)
+                    if (_zk + "_l10") in _p:
+                        del _p[_zk + "_l10"]     # drop temp key so it doesn't bloat the feed
+        except Exception as e:
+            errors["shotZonesL10"] = str(e)
+
+    def ingest_scoring(js):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            p = players[pid]
+            p["ast3Pct"] = num(r.get("PCT_AST_3PM"))
+            p["ast2Pct"] = num(r.get("PCT_AST_2PM"))
+            p["astFgPct"] = num(r.get("PCT_AST_FGM"))
+
+    try:
+        ingest_scoring(get("/leaguedashplayerstats", dash({"MeasureType": "Scoring"})))
+    except Exception as e:
+        errors["scoring"] = str(e)
+
+    # Passing tracking -> how a PLAYER'S OWN ASSISTS split between 3s and 2s.
+    # Every assist is on a made field goal (2 or 3; free throws are never assisted),
+    # so the average points per assist gives the exact mix:
+    #   ppa = AST_PTS_CREATED / AST   (lands between 2 and 3)
+    #   astTo3 = ppa - 2 ;  astTo2 = 1 - astTo3
+    # This is the passer side (where her dimes go), distinct from ast3Pct/ast2Pct
+    # (the shooter side = how often her own makes are assisted).
+    def ptparams(measure):
+        return {
+            "College": "", "Conference": "", "Country": "", "DateFrom": "", "DateTo": "",
+            "Division": "", "DraftPick": "", "DraftYear": "", "GameScope": "", "Height": "",
+            "LastNGames": "0", "LeagueID": LEAGUE, "Location": "", "Month": "0",
+            "OpponentTeamID": "0", "Outcome": "", "PORound": "0", "PerMode": "PerGame",
+            "PlayerExperience": "", "PlayerOrTeam": "Player", "PlayerPosition": "",
+            "PtMeasureType": measure, "Season": SEASON, "SeasonSegment": "",
+            "SeasonType": "Regular Season", "StarterBench": "", "TeamID": "0",
+            "VsConference": "", "VsDivision": "", "Weight": "",
+        }
+
+    def ingest_passing(js):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            players[pid]["potAst"] = num(r.get("POTENTIAL_AST"))   # passes that would be assists if made
+            players[pid]["passesMade"] = num(r.get("PASSES_MADE"))
+            ast = num(r.get("AST"))
+            apc = num(r.get("AST_PTS_CREATED"))
+            if not ast or ast <= 0 or apc is None:
+                continue
+            ppa = apc / ast
+            a3 = ppa - 2.0
+            if a3 < 0:
+                a3 = 0.0
+            if a3 > 1:
+                a3 = 1.0
+            players[pid]["astTo3"] = round(a3, 3)
+            players[pid]["astTo2"] = round(1.0 - a3, 3)
+
+    try:
+        ingest_passing(get("/leaguedashptstats", ptparams("Passing")))
+    except Exception as e:
+        errors["passing"] = str(e)
+
+    # REBOUNDING tracking -> rebound OPPORTUNITY: how many boards the player was in position for
+    # (chances), how often they converted them, and contested boards. The "was he even there" stat.
+    def ingest_rebounding(js):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            p = players[pid]
+            p["rebChances"]    = num(r.get("REB_CHANCES"))    # total rebound chances / game
+            p["orebChances"]   = num(r.get("OREB_CHANCES"))
+            p["drebChances"]   = num(r.get("DREB_CHANCES"))
+            p["orebChancePct"] = num(r.get("OREB_CHANCE_PCT"))  # OREB grabbed / OREB chances
+            p["drebChancePct"] = num(r.get("DREB_CHANCE_PCT"))
+            p["contestedReb"]  = num(r.get("C_REB"))            # contested rebounds / game
+    try:
+        ingest_rebounding(get("/leaguedashptstats", ptparams("Rebounding")))
+    except Exception as e:
+        errors["rebounding"] = str(e)
+
+    # Player positions (single call) -> G/F/C bucket. Needed for defense-vs-position aggregation.
+    def pos_bucket(s):
+        head = (s or "").upper().strip().split("-")[0].strip()
+        if head.startswith("G"):
+            return "G"
+        if head.startswith("F"):
+            return "F"
+        if head.startswith("C"):
+            return "C"
+        return None
+
+    try:
+        pidx = get("/playerindex", {
+            "College": "", "Country": "", "DraftPick": "", "DraftRound": "", "DraftYear": "",
+            "Height": "", "Historical": "0", "LeagueID": LEAGUE, "Season": SEASON,
+            "SeasonType": STYPE, "TeamID": "0", "Weight": "", "Active": "", "AllStar": "",
+        })
+        for r in rows(pidx):
+            pid = r.get("PERSON_ID")
+            b = pos_bucket(r.get("POSITION"))
+            if pid in players and b:
+                players[pid]["pos"] = b
+    except Exception as e:
+        errors["positions"] = str(e)
+
+    # defense-vs-position accumulator: opp_abbr -> pos -> list of per-game allowed lines (each tagged
+    # with its GAME_DATE), filled during ingest_logs. We keep the raw per-game lines (not running
+    # totals) so the aggregation step can blend a SEASON rate with a LAST-10-GAMES rate per team.
+    dvp_acc = {}
+    # opp_abbr -> set of that defense's game dates, so we can pick each team's most-recent N games.
+    dvp_team_dates = {}
+
+    def _fs(pts, reb, ast, stl, blk, tov):
+        # PrizePicks WNBA fantasy score
+        return (pts or 0) + 1.2 * (reb or 0) + 1.5 * (ast or 0) + 3 * (stl or 0) + 3 * (blk or 0) - (tov or 0)
+
+    def classify_arche(p):
+        # Player archetype from her shot-zone profile + assisted%, MUST match the app's wnbaArchClass:
+        #   SELF = self-creator guard (mid) | CS = catch-and-shoot wing (threes) | BIG = roll/paint big.
+        # Powers defense-vs-archetype (dvpArche): fantasy/pts/reb/ast a defense concedes to players like her.
+        if not p:
+            return None
+        zk = ("ra", "paint", "mid", "corner3", "above3")
+        zs = {}
+        tot = 0.0
+        for k in zk:
+            v = p.get("z_" + k)
+            v = 0.0 if (v is None) else v
+            zs[k] = v
+            tot += v
+        if tot <= 0:
+            return None
+        t3 = (zs["corner3"] + zs["above3"]) / tot
+        inte = (zs["ra"] + zs["paint"]) / tot
+        pos = (p.get("pos") or "").upper()
+        big = pos in ("F", "C")
+        a3 = p.get("ast3Pct")
+        af = p.get("astFgPct")
+        if t3 >= 0.42 and a3 is not None and a3 >= 0.62 and (af is None or af >= 0.50):
+            return "CS"
+        if big and inte >= 0.45 and inte >= t3:
+            return "BIG"
+        if not big:
+            return "SELF"
+        if t3 >= 0.40:
+            return "CS"
+        return "BIG"
+
+    # Per-game logs (recent games) -> powers L10 hit-rate + out/usage flags.
+    # PerMode=Totals gives each game's actual raw stat line.
+    def ingest_logs(*jslist):
+        tmp = {}
+        _allrows = []
+        for _js in jslist:
+            if _js is not None:
+                _allrows.extend(rows(_js))
+        for r in _allrows:
+            pid = r.get("PLAYER_ID")
+            if pid is None:
+                continue
+            mn = num(r.get("MIN"))
+            fga = num(r.get("FGA")); fg3a = num(r.get("FG3A")); ftm = num(r.get("FTM")); fta = num(r.get("FTA")); pts = num(r.get("PTS"))
+            reb = num(r.get("REB")); ast = num(r.get("AST"))
+            oreb = num(r.get("OREB")); dreb = num(r.get("DREB"))
+            stl = num(r.get("STL")); blk = num(r.get("BLK")); tov = num(r.get("TOV"))
+            tmp.setdefault(pid, []).append({
+                "d": r.get("GAME_DATE"),
+                "min": mn,
+                "fga": fga,
+                "fg3a": fg3a,
+                "fg3m": num(r.get("FG3M")),
+                "pts": pts,
+                "ftm": ftm,
+                "fta": num(r.get("FTA")),
+                "reb": reb, "oreb": oreb, "dreb": dreb, "ast": ast, "stl": stl, "blk": blk, "tov": tov,
+            })
+            # defense-vs-position: attribute this opposing line to the defense (the opponent)
+            pos = (players.get(pid) or {}).get("pos")
+            mu = r.get("MATCHUP") or ""
+            opp = None
+            for sep in (" @ ", " vs. ", " vs "):
+                if sep in mu:
+                    opp = mu.split(sep)[-1].strip()
+                    break
+            if pos and opp and (mn or 0) >= 1:
+                gdate = r.get("GAME_DATE") or ""
+                dvp_acc.setdefault(opp, {}).setdefault(pos, []).append({
+                    "d": gdate,
+                    "pid": pid,
+                    "fga": (fga or 0),
+                    "fg3a": (fg3a or 0),
+                    "twopa": ((fga or 0) - (fg3a or 0)),
+                    "ftm": (ftm or 0),
+                    "fta": (fta or 0),
+                    "fs": _fs(pts, reb, ast, stl, blk, tov),
+                    "pts": (pts or 0),
+                    "reb": (reb or 0),
+                    "oreb": (oreb or 0),
+                    "dreb": (dreb or 0),
+                    "ast": (ast or 0),
+                    "stl": (stl or 0),
+                    "blk": (blk or 0),
+                    "tov": (tov or 0),
+                })
+                dvp_team_dates.setdefault(opp, set()).add(gdate)
+        for pid, gl in tmp.items():
+            gl.sort(key=lambda g: (g.get("d") or ""), reverse=True)
+            recent = gl[:12]
+            if pid in players:
+                players[pid]["log"] = recent
+            else:
+                players[pid] = {"id": pid, "log": recent}
+
+    try:
+        _reg_logs = get("/playergamelogs", logs_params("Regular Season"))
+        _po_logs = None
+        try:
+            _po_logs = get("/playergamelogs", logs_params("Playoffs"))
+        except Exception as _e2:
+            errors["gameLogsPlayoffs"] = str(_e2)
+        # Merge regular season + playoffs so recent-game logs (the L10 bars) include postseason.
+        ingest_logs(_reg_logs, _po_logs)
+    except Exception as e:
+        errors["gameLogs"] = str(e)
+
+    id2abbr = {}
+    for p in players.values():
+        if p.get("teamId") is not None and p.get("teamAbbr"):
+            id2abbr[p["teamId"]] = p["teamAbbr"]
+
+    teams = {}
+    try:
+        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Advanced"}))):
+            tid = r.get("TEAM_ID")
+            teams[tid] = {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION"),
+                "pace": num(r.get("PACE")), "gp": num(r.get("GP"))}
+    except Exception as e:
+        errors["teamPace"] = str(e)
+
+    try:
+        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent", "LastNGames": "10"}))):
+            tid = r.get("TEAM_ID")
+            t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
+            t["oppFga"] = num(r.get("OPP_FGA"))
+            t["oppFg3a"] = num(r.get("OPP_FG3A"))
+            t["oppFg3Pct"] = num(r.get("OPP_FG3_PCT"))
+            t["oppFta"] = num(r.get("OPP_FTA"))
+            # raw per-game counting stats ALLOWED (for the matchup-favorability panel)
+            t["oppPts"] = num(r.get("OPP_PTS"))
+            t["oppReb"] = num(r.get("OPP_REB"))
+            t["oppAst"] = num(r.get("OPP_AST"))
+            t["oppFg3m"] = num(r.get("OPP_FG3M"))
+            # opponent assist rate = share of allowed FGs that were assisted.
+            # low = this defense forces self-creation (good spot for a self-creator).
+            _oa, _of = r.get("OPP_AST"), r.get("OPP_FGM")
+            try:
+                t["oppAstRate"] = round(float(_oa) / float(_of), 3) if (_oa not in (None, "") and _of not in (None, "", 0)) else None
+            except Exception:
+                t["oppAstRate"] = None
+    except Exception as e:
+        errors["teamOpp"] = str(e)
+
+    # Home/Away opponent splits (full season, for sample stability) for the matchup-favorability
+    # panel: a defense can be far tougher at home than on the road. "_away" = the defense's Road
+    # games, "_home" = its Home games. The app picks the split that matches where the defense plays
+    # in this game (e.g. a road team's defense -> show the _away split).
+    for _loc, _sfx in (("Road", "_away"), ("Home", "_home")):
+        try:
+            for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent", "LastNGames": "0", "Location": _loc}))):
+                tid = r.get("TEAM_ID")
+                t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
+                t["oppPts" + _sfx] = num(r.get("OPP_PTS"))
+                t["oppReb" + _sfx] = num(r.get("OPP_REB"))
+                t["oppAst" + _sfx] = num(r.get("OPP_AST"))
+                t["oppFg3m" + _sfx] = num(r.get("OPP_FG3M"))
+        except Exception as e:
+            errors["teamOppSplit" + _sfx] = str(e)
+
+    # Team OFFENSE free-throw volume -> how much this team DRAWS fouls (attacks the rim). A player who guards a
+    # high-FTA-drawing opponent is at more foul-trouble risk. Stored as a rate (FTA per FGA) + raw per-game FTA.
+    try:
+        for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Base"}))):
+            tid = r.get("TEAM_ID")
+            t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
+            _fta, _fga = num(r.get("FTA")), num(r.get("FGA"))
+            t["ftaOff"] = _fta
+            t["fgaOff"] = _fga
+            try:
+                t["ftaRate"] = round(float(_fta) / float(_fga), 3) if (_fta not in (None, "") and _fga not in (None, "", 0)) else None
+            except Exception:
+                t["ftaRate"] = None
+    except Exception as e:
+        errors["teamBase"] = str(e)
+
+    def ingest_team_zones(js, suffix=""):
+        for r in shot_zone_rows(js):
+            tid = r.get("TEAM_ID")
+            if tid is None:
+                continue
+            t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid)})
+            gg = lambda z: num(r.get(z + "|FGA"))
+            lc, rc = gg("Left Corner 3"), gg("Right Corner 3")
+            t["dz_ra" + suffix] = gg("Restricted Area")
+            t["dz_paint" + suffix] = gg("In The Paint (Non-RA)")
+            t["dz_mid" + suffix] = gg("Mid-Range")
+            t["dz_corner3" + suffix] = round((lc or 0) + (rc or 0), 3)
+            t["dz_above3" + suffix] = gg("Above the Break 3")
+            # opponent FG% ALLOWED per zone (FGM/FGA from the Opponent measure) -> defense efficiency
+            t["dz_ra_pct" + suffix] = _zpct(r, "Restricted Area")
+            t["dz_paint_pct" + suffix] = _zpct(r, "In The Paint (Non-RA)")
+            t["dz_mid_pct" + suffix] = _zpct(r, "Mid-Range")
+            t["dz_corner3_pct" + suffix] = _zpct2(r, "Left Corner 3", "Right Corner 3")
+            t["dz_above3_pct" + suffix] = _zpct(r, "Above the Break 3")
+
+    try:
+        ingest_team_zones(get("/leaguedashteamshotlocations", dash({"MeasureType": "Opponent", "DistanceRange": "By Zone"})))
+    except Exception as e:
+        errors["teamZoneDef"] = str(e)
+
+    # LAST-10-GAMES opponent shot-location defense, blended over the season version so the funnel /
+    # zone-leak logic leans on recent form too (same recency philosophy as the box-score DvP blend).
+    # The team dashboard takes LastNGames natively, so no date reconstruction is needed here.
+    # OPPONENT DEFENSE zones are L10 by default (defense form is recent). NBA_DZONE_W=1.0 means
+    # fully Last-10, still tapered by games played so an early-season thin sample falls back to season.
+    _ZONE_KEYS = ("dz_ra", "dz_paint", "dz_mid", "dz_corner3", "dz_above3",
+                  "dz_ra_pct", "dz_paint_pct", "dz_mid_pct", "dz_corner3_pct", "dz_above3_pct")
+    try:
+        ingest_team_zones(get("/leaguedashteamshotlocations",
+                              dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "LastNGames": "10"})), "_l10")
+        _ZW = float(os.environ.get("NBA_DZONE_W", "1.0"))      # 1.0 = pure L10 defense (tapered early season)
+        _ZFULL = float(os.environ.get("NBA_DVP_FULL", "6"))    # recent games before the weight caps out
+        for _t in teams.values():
+            _nwin = min(10, _t.get("gp") or 0)
+            _w = _ZW * min(1.0, (_nwin / _ZFULL) if _ZFULL > 0 else 1.0)
+            for _zk in _ZONE_KEYS:
+                _s = _t.get(_zk)
+                _r = _t.get(_zk + "_l10")
+                if _s is not None and _r is not None and _w > 0:
+                    _t[_zk] = round((1.0 - _w) * _s + _w * _r, 3)
+                if (_zk + "_l10") in _t:
+                    del _t[_zk + "_l10"]     # drop the temp key so it doesn't bloat the feed
+    except Exception as e:
+        errors["teamZoneDefL10"] = str(e)
+
+    # ---- PLAYOFF BLEND: fold postseason into the CUSH matchup drivers by games played ----
+    # Player shot zones, team defense zones, and opponent style (oppAstRate) get a games-weighted
+    # postseason component so CUSH / the tier matchups reflect playoff form. The L10 game-log bars
+    # and the defense-vs-position allowances already include playoffs via the merged logs above.
+    # Graceful: if there are no playoff games yet, every block below is skipped (pure regular season).
+    try:
+        _po_pgp, _po_tgp = {}, {}
+        try:
+            for r in rows(get("/leaguedashplayerstats", dash({"LastNGames": "0", "SeasonType": "Playoffs"}))):
+                _id = r.get("PLAYER_ID")
+                if _id is not None:
+                    _po_pgp[_id] = num(r.get("GP")) or 0
+        except Exception as _e:
+            errors["playoffPlayerGP"] = str(_e)
+        try:
+            for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Base", "SeasonType": "Playoffs"}))):
+                _id = r.get("TEAM_ID")
+                if _id is not None:
+                    _po_tgp[_id] = num(r.get("GP")) or 0
+        except Exception as _e:
+            errors["playoffTeamGP"] = str(_e)
+        # player shot zones
+        if any(v > 0 for v in _po_pgp.values()):
+            ingest_zones(get("/leaguedashplayershotlocations",
+                             dash({"DistanceRange": "By Zone", "SeasonType": "Playoffs"})), "_po")
+            for _p in players.values():
+                _rg = _p.get("gp") or 0
+                _pg = _po_pgp.get(_p.get("id")) or 0
+                if _pg > 0 and (_rg + _pg) > 0:
+                    for _zk in _PZONE_KEYS:
+                        _s, _v = _p.get(_zk), _p.get(_zk + "_po")
+                        if _s is not None and _v is not None:
+                            _p[_zk] = round((_s * _rg + _v * _pg) / (_rg + _pg), 3)
+                for _zk in _PZONE_KEYS:
+                    if (_zk + "_po") in _p:
+                        del _p[_zk + "_po"]
+        # team defense zones + opponent style rate
+        if any(v > 0 for v in _po_tgp.values()):
+            ingest_team_zones(get("/leaguedashteamshotlocations",
+                                  dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "SeasonType": "Playoffs", "LastNGames": "10"})), "_po")
+            _po_opp = {}
+            try:
+                for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent", "SeasonType": "Playoffs", "LastNGames": "10"}))):
+                    _id = r.get("TEAM_ID")
+                    _oa, _of = r.get("OPP_AST"), r.get("OPP_FGM")
+                    try:
+                        _oar = round(float(_oa) / float(_of), 3) if (_oa not in (None, "") and _of not in (None, "", 0)) else None
+                    except Exception:
+                        _oar = None
+                    _po_opp[_id] = {"oppAstRate": _oar, "oppFg3a": num(r.get("OPP_FG3A")),
+                                    "oppFg3Pct": num(r.get("OPP_FG3_PCT")), "oppFta": num(r.get("OPP_FTA")),
+                                    "oppPts": num(r.get("OPP_PTS")), "oppReb": num(r.get("OPP_REB")),
+                                    "oppAst": num(r.get("OPP_AST")), "oppFg3m": num(r.get("OPP_FG3M"))}
+            except Exception as _e:
+                errors["playoffOpp"] = str(_e)
+            # STRAIGHT RECENT FORM (no season blend): once the postseason starts, a team's recent
+            # games ARE the playoffs, so the opponent-defense zones use the playoff numbers directly
+            # (last 10 playoff games). This is "just L10" -- the defense reflects how a team is
+            # defending right now, not a season-long average that buries a recent collapse or hot
+            # streak. Teams not in the playoffs keep their L10 regular-season defense. No blending.
+            for _t in teams.values():
+                if (_po_tgp.get(_t.get("id")) or 0) > 0:
+                    for _zk in _ZONE_KEYS:
+                        _v = _t.get(_zk + "_po")
+                        if _v is not None:
+                            _t[_zk] = _v
+                    _d = _po_opp.get(_t.get("id"))
+                    if _d:
+                        for _k in ("oppAstRate", "oppFg3a", "oppFg3Pct", "oppFta",
+                                   "oppPts", "oppReb", "oppAst", "oppFg3m"):
+                            _v = _d.get(_k)
+                            if _v is not None:
+                                _t[_k] = _v
+                for _zk in _ZONE_KEYS:
+                    if (_zk + "_po") in _t:
+                        del _t[_zk + "_po"]
+    except Exception as e:
+        errors["playoffZoneBlend"] = str(e)
+
+    # attach defense-vs-position per-game allowances (G/F/C) to each team
+    abbr2id = {v: k for k, v in id2abbr.items()}
+    DVP_KEYS = ["fga", "fg3a", "twopa", "ftm", "fta", "fs", "pts", "reb", "oreb", "dreb", "ast", "stl", "blk", "tov"]
+    DVP_L10_N = int(os.environ.get("NBA_DVP_L10", "10"))     # size of the recent window (team games)
+    DVP_L10_W = float(os.environ.get("NBA_DVP_W", "1.0"))   # max weight on the recent window when it's full
+    DVP_L10_FULL = float(os.environ.get("NBA_DVP_FULL", "6"))  # games needed before recent weight caps out
+
+    def _dvp_rate(lines):
+        gp = len(lines)
+        if gp <= 0:
+            return None, 0
+        return ({k: sum(x[k] for x in lines) / gp for k in DVP_KEYS}, gp)
+
+    for opp_abbr, posmap in dvp_acc.items():
+        tid = abbr2id.get(opp_abbr)
+        if tid is None or tid not in teams:
+            continue
+        # the defending team's most-recent game dates -> the last-10 window (fewer early in the year).
+        recent_dates = set(sorted(dvp_team_dates.get(opp_abbr, set()), reverse=True)[:DVP_L10_N])
+        # lean on the recent window in proportion to how many recent games we actually have, so a
+        # 3-game-old sample doesn't swing a rank; caps at DVP_L10_W once >= DVP_L10_FULL recent games.
+        w = DVP_L10_W * min(1.0, (len(recent_dates) / DVP_L10_FULL) if DVP_L10_FULL > 0 else 1.0)
+        dvp = {}
+        for pos, lines in posmap.items():
+            season_rate, season_gp = _dvp_rate(lines)
+            if season_rate is None:
+                continue
+            l10_rate, l10_gp = _dvp_rate([x for x in lines if x["d"] in recent_dates])
+            if l10_rate is None or w <= 0:
+                blended = season_rate
+            else:
+                blended = {k: (1.0 - w) * season_rate[k] + w * l10_rate[k] for k in DVP_KEYS}
+            entry = {"gp": season_gp, "l10gp": l10_gp}
+            for k in DVP_KEYS:
+                entry[k] = round(blended[k], 2)
+            dvp[pos] = entry
+        if dvp:
+            teams[tid]["dvp"] = dvp
+
+    # defense-vs-ARCHETYPE: re-bucket the same per-game allowed lines by the opposing player's archetype
+    # (self-creator / catch-shoot / roll-paint big) instead of position. Backtest: fantasy CUSH-only
+    # 53.2% -> 56.5% vs the pts+ast composition. Season mean per archetype (fs/pts/reb/ast).
+    ARCHE_STATS = ["fs", "pts", "reb", "ast"]
+    ARCHE_MIN_GP = int(os.environ.get("NBA_DVPARCHE_MIN", "3"))
+    for opp_abbr, posmap in dvp_acc.items():
+        tid = abbr2id.get(opp_abbr)
+        if tid is None or tid not in teams:
+            continue
+        buckets = {}
+        for pos, lines in posmap.items():
+            for x in lines:
+                a = classify_arche(players.get(x.get("pid")))
+                if not a:
+                    continue
+                buckets.setdefault(a, []).append(x)
+        dvpA = {}
+        for a, lines in buckets.items():
+            gp = len(lines)
+            if gp < ARCHE_MIN_GP:
+                continue
+            entry = {"gp": gp}
+            for k in ARCHE_STATS:
+                entry[k] = round(sum(v[k] for v in lines) / gp, 2)
+            dvpA[a] = entry
+        if dvpA:
+            teams[tid]["dvpArche"] = dvpA
+
+    # Real player availability from ESPN (Out / Doubtful / Questionable / Day-To-Day).
+    inj_map, inj_matched = {}, 0
+    try:
+        inj_map = parse_injuries(fetch_injuries_raw())
+    except Exception as e:
+        errors["injuries"] = str(e)
+    if inj_map:
+        for _pl in players.values():
+            _nm = _pl.get("name")
+            if not _nm:
+                continue
+            _st = inj_map.get(pbnorm(_nm))
+            if _st:
+                _pl["injStatus"] = _st["status"]
+                if _st.get("detail"):
+                    _pl["injDetail"] = _st["detail"]
+                inj_matched += 1
+
+    # ============================================================================
+    # NBA ADVANCED DATA (stats.nba.com fully populates these, unlike the WNBA feed):
+    #   Synergy play types (offense per player + defense per team = "D v PLAY"),
+    #   player tracking (catch&shoot / drives / pull-ups / touches), hustle stats,
+    #   and rim defense. All defensive: any failure just omits that slice.
+    # ============================================================================
+    adv_debug = {}
+
+    SYN_TYPES = ["Transition", "Isolation", "PRBallHandler", "PRRollman", "Postup",
+                 "Spotup", "Handoff", "Cut", "OffScreen", "OffRebound", "Misc"]
+    def syn_params(play_type, grouping, por):
+        return {"LeagueID": LEAGUE, "PerMode": "PerGame", "PlayType": play_type,
+                "PlayerOrTeam": por, "SeasonType": STYPE, "SeasonYear": SEASON,
+                "TypeGrouping": grouping}
+    def ingest_syn_off(pt, js):
+        n = 0
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is not None and pid in players:
+                v = num(r.get("PTS"))
+                if v is not None:
+                    players[pid].setdefault("syn", {})[pt] = v; n += 1
+        return n
+    def ingest_syn_def(pt, js):
+        for r in rows(js):
+            tid = r.get("TEAM_ID")
+            if tid is not None and tid in teams:
+                teams[tid].setdefault("synDef", {})[pt] = {
+                    "pts": num(r.get("PTS")), "poss": num(r.get("POSS")), "ppp": num(r.get("PPP"))}
+    _syn_n = 0
+    for _pt in SYN_TYPES:
+        try:
+            _syn_n += ingest_syn_off(_pt, get("/synergyplaytypes", syn_params(_pt, "offensive", "P")))
+        except Exception as _e:
+            errors["synOff_" + _pt] = str(_e)
+    for _pt in SYN_TYPES:
+        try:
+            ingest_syn_def(_pt, get("/synergyplaytypes", syn_params(_pt, "defensive", "T")))
+        except Exception as _e:
+            errors["synDef_" + _pt] = str(_e)
+    adv_debug["synOffRows"] = _syn_n
+
+    def ingest_track(js, mapping, dbg=None):
+        c = 0
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            t = players[pid].setdefault("track", {})
+            for src, dst in mapping.items():
+                v = num(r.get(src))
+                if v is not None:
+                    t[dst] = v
+            c += 1
+        if dbg is not None:
+            adv_debug[dbg] = c
+        return c
+    try:
+        ingest_track(get("/leaguedashptstats", ptparams("CatchShoot")),
+                     {"CATCH_SHOOT_PTS": "csPts", "CATCH_SHOOT_FG3M": "cs3m",
+                      "CATCH_SHOOT_FG3A": "cs3a", "CATCH_SHOOT_FG_PCT": "csFgPct"}, "csRows")
+    except Exception as _e:
+        errors["trkCatchShoot"] = str(_e)
+    try:
+        ingest_track(get("/leaguedashptstats", ptparams("Drives")),
+                     {"DRIVES": "drives", "DRIVE_PTS": "drivePts", "DRIVE_FG_PCT": "driveFgPct",
+                      "DRIVE_PASSES": "drivePass", "DRIVE_AST": "driveAst"}, "drRows")
+    except Exception as _e:
+        errors["trkDrives"] = str(_e)
+    try:
+        ingest_track(get("/leaguedashptstats", ptparams("PullUpShot")),
+                     {"PULL_UP_PTS": "pullPts", "PULL_UP_FG3M": "pull3m", "PULL_UP_FG_PCT": "pullFgPct"}, "pullRows")
+    except Exception as _e:
+        errors["trkPullUp"] = str(_e)
+    for _cat, _m in (("ElbowTouch", {"ELBOW_TOUCHES": "elbowTch", "ELBOW_TOUCH_PTS": "elbowPts"}),
+                     ("PostTouch", {"POST_TOUCHES": "postTch", "POST_TOUCH_PTS": "postPts"}),
+                     ("PaintTouch", {"PAINT_TOUCHES": "paintTch", "PAINT_TOUCH_PTS": "paintPts"})):
+        try:
+            ingest_track(get("/leaguedashptstats", ptparams(_cat)), _m)
+        except Exception as _e:
+            errors["trk" + _cat] = str(_e)
+
+    # Hustle stats
+    def _noptype(extra=None):
+        p = ptparams("")
+        p.pop("PtMeasureType", None)
+        if extra:
+            p.update(extra)
+        return p
+    try:
+        c = 0
+        for r in rows(get("/leaguehustlestatsplayer", _noptype())):
+            pid = r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            players[pid]["hustle"] = {
+                "deflections": num(r.get("DEFLECTIONS")),
+                "screenAst": num(r.get("SCREEN_ASSISTS")),
+                "looseRec": num(r.get("LOOSE_BALLS_RECOVERED")),
+                "boxOuts": num(r.get("BOX_OUTS")),
+                "chargesDrawn": num(r.get("CHARGES_DRAWN")),
+                "contested2": num(r.get("CONTESTED_SHOTS_2PT")),
+                "contested3": num(r.get("CONTESTED_SHOTS_3PT")),
+            }
+            c += 1
+        adv_debug["hustleRows"] = c
+    except Exception as _e:
+        errors["hustle"] = str(_e)
+
+    # Rim defense (defender FG% allowed within 6 ft)
+    try:
+        c = 0
+        for r in rows(get("/leaguedashptdefend", _noptype({"DefenseCategory": "Less Than 6Ft"}))):
+            pid = r.get("CLOSE_DEF_PERSON_ID") or r.get("PLAYER_ID")
+            if pid is None or pid not in players:
+                continue
+            players[pid]["defRim"] = {
+                "fga": num(r.get("D_FGA")), "fgm": num(r.get("D_FGM")),
+                "fgPct": num(r.get("D_FG_PCT")), "normFgPct": num(r.get("NORMAL_FG_PCT")),
+                "diffPct": num(r.get("PCT_PLUSMINUS")),
+            }
+            c += 1
+        adv_debug["rimDefRows"] = c
+    except Exception as _e:
+        errors["rimDefense"] = str(_e)
+    out = {
+        "updated": datetime.datetime.utcnow().isoformat() + "Z",
+        "season": SEASON, "gameDate": game_date,
+        "counts": {"games": len(games), "players": len(players), "teams": len(teams), "injListed": len(inj_map), "injMatched": inj_matched, "posMatched": sum(1 for p in players.values() if p.get("pos")), "dvpTeams": sum(1 for t in teams.values() if t.get("dvp"))},
+        "games": games, "teams": teams, "players": players,
+    }
+    if adv_debug:
+        out["advDebug"] = adv_debug
+    if errors:
+        out["errors"] = errors
+
+    with open(OUT, "w") as f:
+        json.dump(out, f, separators=(",", ":"))
+
+    print("WROTE", OUT, out["counts"], ("ERRORS: " + json.dumps(errors)) if errors else "")
+    if not players and not games:
+        raise SystemExit("no data fetched -- stats.nba.com likely blocked this runner")
+
+
+if __name__ == "__main__":
+    main()
