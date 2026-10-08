@@ -948,6 +948,25 @@ def main():
                 "pts": num(r.get("PTS")), "poss": num(r.get("POSS")), "ppp": num(r.get("PPP")),
             }
 
+    # one-shot diagnostics: capture what the synergy endpoint actually returns so we can map fields
+    syn_debug = {}
+    try:
+        _dbg = get("/synergyplaytypes", syn_params("Spotup", "offensive", "P"))
+        _rs = (_dbg or {}).get("resultSets") or (_dbg or {}).get("resultSet") or []
+        if isinstance(_rs, dict):
+            _rs = [_rs]
+        syn_debug["topKeys"] = list((_dbg or {}).keys())
+        if _rs:
+            syn_debug["rsName"] = _rs[0].get("name")
+            syn_debug["headers"] = _rs[0].get("headers")
+            _rows0 = _rs[0].get("rowSet") or []
+            syn_debug["rowCount"] = len(_rows0)
+            syn_debug["firstRow"] = _rows0[0] if _rows0 else None
+        else:
+            syn_debug["raw"] = json.dumps(_dbg)[:800]
+    except Exception as _e:
+        syn_debug["error"] = str(_e)
+
     for _pt in SYN_TYPES:
         try:
             ingest_syn_off(_pt, get("/synergyplaytypes", syn_params(_pt, "offensive", "P")))
@@ -965,6 +984,8 @@ def main():
         "counts": {"games": len(games), "players": len(players), "teams": len(teams), "injListed": len(inj_map), "injMatched": inj_matched, "posMatched": sum(1 for p in players.values() if p.get("pos")), "dvpTeams": sum(1 for t in teams.values() if t.get("dvp"))},
         "games": games, "teams": teams, "players": players,
     }
+    if syn_debug:
+        out["synDebug"] = syn_debug
     if errors:
         out["errors"] = errors
 
