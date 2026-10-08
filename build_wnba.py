@@ -784,9 +784,16 @@ def main():
                                     "oppFg3Pct": num(r.get("OPP_FG3_PCT")), "oppFta": num(r.get("OPP_FTA"))}
             except Exception as _e:
                 errors["playoffOpp"] = str(_e)
+            # RECENT-FORM WINDOW: weight the postseason by its games played and fill the rest of a
+            # last-N-games window with recent regular-season form, instead of diluting the playoffs
+            # by the full-season GP. This makes the opponent-defense zones reflect how a team is
+            # defending NOW (playoffs included) -- a team that has started leaking 3s in the
+            # postseason flips toward "gives it up" even if its season-long zone D was stingy.
+            # Tunable via WNBA_DEF_NWIN (smaller window = heavier weight on the recent playoff games).
+            _NWIN = int(os.environ.get("WNBA_DEF_NWIN", "10"))
             for _t in teams.values():
-                _rg = _t.get("gp") or 0
-                _pg = _po_tgp.get(_t.get("id")) or 0
+                _pg = min(_NWIN, _po_tgp.get(_t.get("id")) or 0)
+                _rg = max(0, _NWIN - _pg)
                 if _pg > 0 and (_rg + _pg) > 0:
                     for _zk in _ZONE_KEYS:
                         _s, _v = _t.get(_zk), _t.get(_zk + "_po")
