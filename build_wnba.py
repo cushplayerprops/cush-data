@@ -655,6 +655,11 @@ def main():
             t["oppFg3a"] = num(r.get("OPP_FG3A"))
             t["oppFg3Pct"] = num(r.get("OPP_FG3_PCT"))
             t["oppFta"] = num(r.get("OPP_FTA"))
+            # raw per-game counting stats ALLOWED (for the matchup-favorability panel)
+            t["oppPts"] = num(r.get("OPP_PTS"))
+            t["oppReb"] = num(r.get("OPP_REB"))
+            t["oppAst"] = num(r.get("OPP_AST"))
+            t["oppFg3m"] = num(r.get("OPP_FG3M"))
             # opponent assist rate = share of allowed FGs that were assisted.
             # low = this defense forces self-creation (good spot for a self-creator).
             _oa, _of = r.get("OPP_AST"), r.get("OPP_FGM")
@@ -664,6 +669,22 @@ def main():
                 t["oppAstRate"] = None
     except Exception as e:
         errors["teamOpp"] = str(e)
+
+    # Home/Away opponent splits (full season, for sample stability) for the matchup-favorability
+    # panel: a defense can be far tougher at home than on the road. "_away" = the defense's Road
+    # games, "_home" = its Home games. The app picks the split that matches where the defense plays
+    # in this game (e.g. a road team's defense -> show the _away split).
+    for _loc, _sfx in (("Road", "_away"), ("Home", "_home")):
+        try:
+            for r in rows(get("/leaguedashteamstats", dash({"MeasureType": "Opponent", "LastNGames": "0", "Location": _loc}))):
+                tid = r.get("TEAM_ID")
+                t = teams.get(tid) or teams.setdefault(tid, {"id": tid, "abbr": id2abbr.get(tid) or r.get("TEAM_ABBREVIATION")})
+                t["oppPts" + _sfx] = num(r.get("OPP_PTS"))
+                t["oppReb" + _sfx] = num(r.get("OPP_REB"))
+                t["oppAst" + _sfx] = num(r.get("OPP_AST"))
+                t["oppFg3m" + _sfx] = num(r.get("OPP_FG3M"))
+        except Exception as e:
+            errors["teamOppSplit" + _sfx] = str(e)
 
     # Team OFFENSE free-throw volume -> how much this team DRAWS fouls (attacks the rim). A player who guards a
     # high-FTA-drawing opponent is at more foul-trouble risk. Stored as a rate (FTA per FGA) + raw per-game FTA.
@@ -781,7 +802,9 @@ def main():
                     except Exception:
                         _oar = None
                     _po_opp[_id] = {"oppAstRate": _oar, "oppFg3a": num(r.get("OPP_FG3A")),
-                                    "oppFg3Pct": num(r.get("OPP_FG3_PCT")), "oppFta": num(r.get("OPP_FTA"))}
+                                    "oppFg3Pct": num(r.get("OPP_FG3_PCT")), "oppFta": num(r.get("OPP_FTA")),
+                                    "oppPts": num(r.get("OPP_PTS")), "oppReb": num(r.get("OPP_REB")),
+                                    "oppAst": num(r.get("OPP_AST")), "oppFg3m": num(r.get("OPP_FG3M"))}
             except Exception as _e:
                 errors["playoffOpp"] = str(_e)
             # STRAIGHT RECENT FORM (no season blend): once the postseason starts, a team's recent
@@ -797,7 +820,8 @@ def main():
                             _t[_zk] = _v
                     _d = _po_opp.get(_t.get("id"))
                     if _d:
-                        for _k in ("oppAstRate", "oppFg3a", "oppFg3Pct", "oppFta"):
+                        for _k in ("oppAstRate", "oppFg3a", "oppFg3Pct", "oppFta",
+                                   "oppPts", "oppReb", "oppAst", "oppFg3m"):
                             _v = _d.get(_k)
                             if _v is not None:
                                 _t[_k] = _v
