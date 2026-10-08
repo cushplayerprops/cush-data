@@ -1,0 +1,47 @@
+name: Build nba_stats
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "NBA season, e.g. 2025-26 (blank = default 2025-26)"
+        required: false
+        default: ""
+      season_type:
+        description: "Regular Season or Pre Season (blank = Regular Season)"
+        required: false
+        default: ""
+  schedule:
+    # odd minute, several times a day (GitHub cron drops :00 jobs under load)
+    - cron: "23 11,15,19,23 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Build nba_stats.json
+        env:
+          SCRAPEOPS_API_KEY: ${{ secrets.SCRAPEOPS_API_KEY }}
+          NBA_SEASON: ${{ github.event.inputs.season }}
+          NBA_SEASON_TYPE: ${{ github.event.inputs.season_type }}
+        run: python build_nba.py
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add nba_stats.json
+          git diff --staged --quiet || git commit -m "update nba_stats.json"
+          git push
