@@ -948,24 +948,31 @@ def main():
                 "pts": num(r.get("PTS")), "poss": num(r.get("POSS")), "ppp": num(r.get("PPP")),
             }
 
-    # one-shot diagnostics: capture what the synergy endpoint actually returns so we can map fields
+    # one-shot PARAM SWEEP: synergy endpoint + fields are confirmed correct; find the param combo
+    # that actually returns rows for WNBA (season year / season type / per-mode).
     syn_debug = {}
-    try:
-        _dbg = get("/synergyplaytypes", syn_params("Spotup", "offensive", "P"))
-        _rs = (_dbg or {}).get("resultSets") or (_dbg or {}).get("resultSet") or []
-        if isinstance(_rs, dict):
-            _rs = [_rs]
-        syn_debug["topKeys"] = list((_dbg or {}).keys())
-        if _rs:
-            syn_debug["rsName"] = _rs[0].get("name")
-            syn_debug["headers"] = _rs[0].get("headers")
-            _rows0 = _rs[0].get("rowSet") or []
-            syn_debug["rowCount"] = len(_rows0)
-            syn_debug["firstRow"] = _rows0[0] if _rows0 else None
-        else:
-            syn_debug["raw"] = json.dumps(_dbg)[:800]
-    except Exception as _e:
-        syn_debug["error"] = str(_e)
+    def _syn_rowcount(params):
+        try:
+            js = get("/synergyplaytypes", params)
+            rs = (js or {}).get("resultSets") or []
+            if not rs:
+                return "no-rs"
+            rc = len(rs[0].get("rowSet") or [])
+            fr = (rs[0].get("rowSet") or [None])[0]
+            return {"rows": rc, "sample": fr[:12] if fr else None}
+        except Exception as _e:
+            return "ERR:" + str(_e)[:60]
+    _base = {"LeagueID": LEAGUE, "PlayType": "Spotup", "PlayerOrTeam": "P", "TypeGrouping": "offensive"}
+    _combos = {
+        "2026_reg_pg":  dict(_base, SeasonYear="2026", SeasonType="Regular Season", PerMode="PerGame"),
+        "2026_po_pg":   dict(_base, SeasonYear="2026", SeasonType="Playoffs",       PerMode="PerGame"),
+        "2025_reg_pg":  dict(_base, SeasonYear="2025", SeasonType="Regular Season", PerMode="PerGame"),
+        "2025_po_pg":   dict(_base, SeasonYear="2025", SeasonType="Playoffs",       PerMode="PerGame"),
+        "2026_reg_tot": dict(_base, SeasonYear="2026", SeasonType="Regular Season", PerMode="Totals"),
+        "2026_reg_season": dict(_base, Season="2026", SeasonType="Regular Season", PerMode="PerGame"),
+    }
+    for _lbl, _pp in _combos.items():
+        syn_debug[_lbl] = _syn_rowcount(_pp)
 
     for _pt in SYN_TYPES:
         try:
