@@ -1,0 +1,25 @@
+name: Refresh NFL Monte Carlo profiles
+on:
+  schedule:
+    # Tuesdays 13:00 UTC (~8am ET) — after Monday-night games are final
+    - cron: '0 13 * * 2'
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build Monte Carlo profiles from nflverse play-by-play
+        run: python build_nfl_mc.py
+      - name: Commit refreshed nfl_mc.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add nfl_mc.json
+          git diff --cached --quiet || git commit -m "auto: refresh nfl_mc.json (weekly)"
+          git push
