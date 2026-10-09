@@ -1,0 +1,34 @@
+name: nfl-team-adv
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "Force season (blank = auto-detect newest)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "47 12 * * *"
+    - cron: "47 16 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build nfl_team_adv.json
+        env:
+          NFL_TADV_SEASON: ${{ github.event.inputs.season }}
+        run: python build_nfl_team_adv.py
+      - name: Commit
+        run: |
+          git config user.name "cush-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add nfl_team_adv.json
+          if git diff --cached --quiet; then echo "no changes"; else git commit -m "update nfl_team_adv.json [auto]"; git push; fi
