@@ -1067,10 +1067,15 @@ def main():
             if pid is None or pid not in players:
                 continue
             players[pid]["defRim"] = {
-                "fga": num(r.get("D_FGA")), "fgm": num(r.get("D_FGM")),
-                "fgPct": num(r.get("D_FG_PCT")), "normFgPct": num(r.get("NORMAL_FG_PCT")),
-                "diffPct": num(r.get("PCT_PLUSMINUS")),
+                "fga": num(r.get("FGA_LT_06")), "fgm": num(r.get("FGM_LT_06")),
+                "fgPct": num(r.get("LT_06_PCT")), "normFgPct": num(r.get("NS_LT_06_PCT")),
+                "diffPct": num(r.get("PLUSMINUS")),
             }
+            # position fallback: this feed carries PLAYER_POSITION for ~all players
+            if not players[pid].get("pos"):
+                _pb = pos_bucket(r.get("PLAYER_POSITION"))
+                if _pb:
+                    players[pid]["pos"] = _pb
             c += 1
         adv_debug["rimDefRows"] = c
     except Exception as _e:
