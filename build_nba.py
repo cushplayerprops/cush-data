@@ -623,15 +623,43 @@ def main():
             else:
                 players[pid] = {"id": pid, "log": recent}
 
-    try:
-        _reg_logs = get("/playergamelogs", logs_params("Regular Season"))
-        _po_logs = None
+    # NBA scale: a full season of playergamelogs (~7MB) overruns the proxy and the JSON
+    # truncates, so pull the season month-by-month (DateFrom/DateTo) and merge the chunks.
+    def _season_month_windows():
+        import calendar
         try:
-            _po_logs = get("/playergamelogs", logs_params("Playoffs"))
+            y0 = int(str(SEASON).split("-")[0])
+        except Exception:
+            y0 = datetime.datetime.now().year
+        months = [(y0, m) for m in (10, 11, 12)] + [(y0 + 1, m) for m in range(1, 7)]
+        out = []
+        for (yy, mm) in months:
+            last = calendar.monthrange(yy, mm)[1]
+            out.append(("%02d/01/%04d" % (mm, yy), "%02d/%02d/%04d" % (mm, last, yy)))
+        return out
+
+    try:
+        _chunks = []
+        for (dfrom, dto) in _season_month_windows():
+            try:
+                lp = logs_params(STYPE)
+                lp["DateFrom"] = dfrom
+                lp["DateTo"] = dto
+                _js = get("/playergamelogs", lp)
+                if rows(_js):
+                    _chunks.append(_js)
+            except Exception as _ce:
+                errors.setdefault("gameLogsChunk", str(_ce))
+        try:
+            _po = get("/playergamelogs", logs_params("Playoffs"))
+            if rows(_po):
+                _chunks.append(_po)
         except Exception as _e2:
             errors["gameLogsPlayoffs"] = str(_e2)
-        # Merge regular season + playoffs so recent-game logs (the L10 bars) include postseason.
-        ingest_logs(_reg_logs, _po_logs)
+        if _chunks:
+            ingest_logs(*_chunks)
+        else:
+            errors["gameLogs"] = "no log chunks returned"
     except Exception as e:
         errors["gameLogs"] = str(e)
 
@@ -1029,8 +1057,12 @@ def main():
 
     # Rim defense (defender FG% allowed within 6 ft)
     try:
+        _dj = get("/leaguedashptdefend", _noptype({"DefenseCategory": "Less Than 6Ft"}))
+        _drs = (_dj or {}).get("resultSets") or []
+        if _drs:
+            adv_debug["rimDefHeaders"] = _drs[0].get("headers")
         c = 0
-        for r in rows(get("/leaguedashptdefend", _noptype({"DefenseCategory": "Less Than 6Ft"}))):
+        for r in rows(_dj):
             pid = r.get("CLOSE_DEF_PERSON_ID") or r.get("PLAYER_ID")
             if pid is None or pid not in players:
                 continue
