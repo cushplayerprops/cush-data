@@ -12,7 +12,7 @@
 
 import os, sys, json, csv, io, time, datetime, urllib.request
 
-REL = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/stats_player_week_{season}.csv"
+REL = "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_{season}.csv"
 OUT = "nfl_def.json"
 STYPE = os.environ.get("NFL_DEF_SEASON_TYPE") or "REG"
 MIN_SEASON_COMB = 5          # drop players with < this many combined tackles on the season (noise)
