@@ -1,0 +1,40 @@
+name: nfl-def
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "Force season (blank = auto-detect newest)"
+        required: false
+        default: ""
+  schedule:
+    # Tue/Wed/Thu/Fri/Sat/Sun mornings + a midday refresh (UTC); catches post-game updates
+    - cron: "41 12 * * *"
+    - cron: "41 16 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build nfl_def.json
+        env:
+          NFL_DEF_SEASON: ${{ github.event.inputs.season }}
+        run: python build_nfl_def.py
+      - name: Commit
+        run: |
+          git config user.name "cush-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add nfl_def.json
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "update nfl_def.json [auto]"
+            git push
+          fi
