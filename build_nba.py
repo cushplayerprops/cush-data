@@ -787,6 +787,8 @@ def main():
     # postseason component so CUSH / the tier matchups reflect playoff form. The L10 game-log bars
     # and the defense-vs-position allowances already include playoffs via the merged logs above.
     # Graceful: if there are no playoff games yet, every block below is skipped (pure regular season).
+    # Playoff overwrite OFF by default: zones + opp defense stats stay REGULAR SEASON (matches PropsMadness / NBA.com opponent-shooting). Set NBA_PLAYOFF_BLEND=1 to fold recent playoff form in during an active postseason. (Auto-skips anyway when there are no playoff games, e.g. early in a new season.)
+    _PO_BLEND = os.environ.get("NBA_PLAYOFF_BLEND", "0") == "1"
     try:
         _po_pgp, _po_tgp = {}, {}
         try:
@@ -804,7 +806,7 @@ def main():
         except Exception as _e:
             errors["playoffTeamGP"] = str(_e)
         # player shot zones
-        if any(v > 0 for v in _po_pgp.values()):
+        if _PO_BLEND and any(v > 0 for v in _po_pgp.values()):
             ingest_zones(get("/leaguedashplayershotlocations",
                              dash({"DistanceRange": "By Zone", "SeasonType": "Playoffs"})), "_po")
             for _p in players.values():
@@ -819,7 +821,7 @@ def main():
                     if (_zk + "_po") in _p:
                         del _p[_zk + "_po"]
         # team defense zones + opponent style rate
-        if any(v > 0 for v in _po_tgp.values()):
+        if _PO_BLEND and any(v > 0 for v in _po_tgp.values()):
             ingest_team_zones(get("/leaguedashteamshotlocations",
                                   dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "SeasonType": "Playoffs", "LastNGames": "10"})), "_po")
             _po_opp = {}
