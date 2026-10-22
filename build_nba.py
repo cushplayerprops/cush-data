@@ -767,7 +767,7 @@ def main():
     try:
         ingest_team_zones(get("/leaguedashteamshotlocations",
                               dash({"MeasureType": "Opponent", "DistanceRange": "By Zone", "LastNGames": "10"})), "_l10")
-        _ZW = float(os.environ.get("NBA_DZONE_W", "1.0"))      # 1.0 = pure L10 defense (tapered early season)
+        _ZW = float(os.environ.get("NBA_DZONE_W", "0.0"))      # 0.0 = FULL-SEASON zones (matches PropsMadness / NBA.com opponent-shooting-by-zone). Flip to 1.0 when 2026-27 has ~10 games to use L10 recency again.
         _ZFULL = float(os.environ.get("NBA_DVP_FULL", "6"))    # recent games before the weight caps out
         for _t in teams.values():
             _nwin = min(10, _t.get("gp") or 0)
