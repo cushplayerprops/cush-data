@@ -1080,6 +1080,64 @@ def main():
         adv_debug["rimDefRows"] = c
     except Exception as _e:
         errors["rimDefense"] = str(_e)
+    # Player shot-type VOLUME (NBA.com "Players - Shots General"), same source family
+    # as the opponent-shots table below so the Shot Type panel's player bars and the
+    # defensive ranks come from one consistent dataset. FGA/FGM/FG% per range.
+    #   csShot_* = Catch and Shoot,  puShot_* = Pull-ups,  lt10Shot_* = <10 ft
+    def _pshot_params(general_range):
+        p = ptparams("")
+        p.pop("PtMeasureType", None)
+        p.update({"GeneralRange": general_range, "DribbleRange": "", "CloseDefDistRange": "",
+                  "TouchTimeRange": "", "ShotDistRange": "", "ShotClockRange": ""})
+        return p
+    for _gr, _pfx in (("Catch and Shoot", "csShot"),
+                      ("Pullups", "puShot"),
+                      ("Less Than 10 ft", "lt10Shot")):
+        try:
+            _c = 0
+            for r in rows(get("/leaguedashplayerptshot", _pshot_params(_gr))):
+                pid = r.get("PLAYER_ID")
+                if pid is None or pid not in players:
+                    continue
+                players[pid][_pfx + "_fga"] = num(r.get("FGA"))
+                players[pid][_pfx + "_fgm"] = num(r.get("FGM"))
+                players[pid][_pfx + "_pct"] = num(r.get("FG_PCT"))
+                _c += 1
+            adv_debug["pShot_" + _pfx] = _c
+        except Exception as _e:
+            errors["pShot_" + _pfx] = str(_e)
+
+    # Opponent shooting by shot-type (NBA.com "Opponent Shooting - General").
+    # ONE endpoint, one row per team, forced to current season via dash(). Gives the
+    # REAL opponent FGA/FGM/FG% ALLOWED for Catch & Shoot, Pull-ups, and <10 ft so the
+    # app's Shot Type panel stops approximating pull-up/rim from the by-zone table.
+    #   C&S rank  -> oppCS_fga   (attempts allowed)
+    #   Pull-up   -> oppPU_fga / oppPU_fgm
+    #   <10 ft    -> oppLt10_fgm (makes allowed)  + oppLt10_fga / _pct
+    def _oppshot_params(general_range):
+        p = dash({})
+        p.pop("MeasureType", None)            # leaguedashoppptshot has no MeasureType
+        p.update({"GeneralRange": general_range, "DribbleRange": "",
+                  "CloseDefDistRange": "", "TouchTimeRange": "", "ShotDistRange": ""})
+        return p
+    for _gr, _pfx in (("Catch and Shoot", "oppCS"),
+                      ("Pullups", "oppPU"),
+                      ("Less Than 10 ft", "oppLt10")):
+        try:
+            _c = 0
+            for r in rows(get("/leaguedashoppptshot", _oppshot_params(_gr))):
+                tid = r.get("TEAM_ID")
+                t = teams.get(tid) if tid is not None else None
+                if t is None:
+                    continue
+                t[_pfx + "_fga"] = num(r.get("FGA"))
+                t[_pfx + "_fgm"] = num(r.get("FGM"))
+                t[_pfx + "_pct"] = num(r.get("FG_PCT"))
+                _c += 1
+            adv_debug["oppShot_" + _pfx] = _c
+        except Exception as _e:
+            errors["oppShot_" + _pfx] = str(_e)
+
     out = {
         "updated": datetime.datetime.utcnow().isoformat() + "Z",
         "season": SEASON, "gameDate": game_date,
