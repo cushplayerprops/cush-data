@@ -886,7 +886,18 @@ def main():
         # 3-game-old sample doesn't swing a rank; caps at DVP_L10_W once >= DVP_L10_FULL recent games.
         w = DVP_L10_W * min(1.0, (len(recent_dates) / DVP_L10_FULL) if DVP_L10_FULL > 0 else 1.0)
         dvp = {}
+        dvpLog = {}
         for pos, lines in posmap.items():
+            # raw per-game opposing lines (date + pid + stats) so the UI can show similar players'
+            # ACTUAL production vs this defense — the "Similar Players REB vs <opp>" game log
+            # (date / result / vs their season avg). Most-recent first.
+            if lines:
+                _sorted = sorted(lines, key=lambda x: (x.get("d") or ""), reverse=True)
+                dvpLog[pos] = [{"d": x.get("d"), "pid": x.get("pid"),
+                                "pts": x.get("pts"), "reb": x.get("reb"), "oreb": x.get("oreb"), "dreb": x.get("dreb"),
+                                "ast": x.get("ast"), "stl": x.get("stl"), "blk": x.get("blk"), "tov": x.get("tov"),
+                                "fga": x.get("fga"), "fg3a": x.get("fg3a"), "twopa": x.get("twopa"),
+                                "fta": x.get("fta"), "ftm": x.get("ftm"), "fs": x.get("fs")} for x in _sorted]
             season_rate, season_gp = _dvp_rate(lines)
             if season_rate is None:
                 continue
@@ -901,6 +912,8 @@ def main():
             dvp[pos] = entry
         if dvp:
             teams[tid]["dvp"] = dvp
+            if dvpLog:
+                teams[tid]["dvpLog"] = dvpLog
 
     # defense-vs-ARCHETYPE: re-bucket the same per-game allowed lines by the opposing player's archetype
     # (self-creator / catch-shoot / roll-paint big) instead of position. Backtest: fantasy CUSH-only
