@@ -34,20 +34,23 @@ HEADERS = {
 }
 
 
-def get(path, params, tries=4):
+def get(path, params, tries=7):
+    # Resilient against intermittent ScrapeOps/NBA.com throttling: a shorter per-request timeout so a HUNG proxy
+    # instance fails fast (instead of burning 130s), but MORE retries with capped backoff so the crawl keeps
+    # grabbing fresh proxy instances until one gets through — this is why daytime builds were hanging ~57 min.
     target = BASE + path + "?" + urlencode(params)
     proxy_payload = {"api_key": SCRAPEOPS_KEY, "url": target, "residential": "true", "keep_headers": "true"}
     proxy_url = PROXY + "?" + urlencode(proxy_payload)
     last = None
     for i in range(tries):
         try:
-            r = requests.get(proxy_url, headers=HEADERS, timeout=130)
+            r = requests.get(proxy_url, headers=HEADERS, timeout=55)
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last = e
             print(f"  retry {i+1}/{tries} for {path}: {e}")
-            time.sleep(3 + i * 3)
+            time.sleep(min(2 + i * 2, 12))
     raise last
 
 
@@ -143,7 +146,7 @@ def pbnorm(s):
     return s
 
 
-def get_url(full_url, tries=4, residential=True):
+def get_url(full_url, tries=7, residential=True):
     payload = {"api_key": SCRAPEOPS_KEY, "url": full_url}
     if residential:
         payload["residential"] = "true"
@@ -151,13 +154,13 @@ def get_url(full_url, tries=4, residential=True):
     last = None
     for i in range(tries):
         try:
-            r = requests.get(proxy_url, timeout=130)
+            r = requests.get(proxy_url, timeout=55)
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last = e
             print(f"  retry {i+1}/{tries} for proxied url: {e}")
-            time.sleep(3 + i * 3)
+            time.sleep(min(2 + i * 2, 12))
     raise last
 
 
