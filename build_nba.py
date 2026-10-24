@@ -11,7 +11,7 @@ import os, json, time, datetime, re, unicodedata
 import requests
 from urllib.parse import urlencode
 
-SEASON = os.environ.get("NBA_SEASON") or "2025-26"
+SEASON = os.environ.get("NBA_SEASON") or "2026-27"
 LEAGUE = "00"
 STYPE  = os.environ.get("NBA_SEASON_TYPE") or "Regular Season"  # "Pre Season" to test now, "Regular Season" live
 OUT    = os.environ.get("OUT", "nba_stats.json")
