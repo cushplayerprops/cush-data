@@ -3,7 +3,8 @@
 build_nba.py - NBA feed for cushplayerprops.win. Schedule + player
 3PA/FGA/PTS/MIN + shot zones + assisted rate + per-game logs + team pace +
 opponent defense (totals, FT-allowed, AND by-zone) + player free throws from stats.nba.com. Runs from GitHub
-Actions via the ScrapeOps residential proxy (needs SCRAPEOPS_API_KEY secret).
+Actions via the ScraperAPI proxy (needs SCRAPERAPI_KEY secret; also reads the
+legacy SCRAPEOPS_API_KEY secret so the existing workflow secret keeps working).
 Requires: pip install requests
 """
 
@@ -17,8 +18,8 @@ STYPE  = os.environ.get("NBA_SEASON_TYPE") or "Regular Season"  # "Pre Season" t
 OUT    = os.environ.get("OUT", "nba_stats.json")
 BASE   = "https://stats.nba.com/stats"
 
-SCRAPEOPS_KEY = os.environ.get("SCRAPEOPS_API_KEY", "")
-PROXY = "https://proxy.scrapeops.io/v1/"
+SA_KEY = os.environ.get("SCRAPERAPI_KEY") or os.environ.get("SCRAPEOPS_API_KEY", "")  # ScraperAPI key; also accepts the legacy SCRAPEOPS_API_KEY secret so no workflow change is needed
+PROXY = "https://api.scraperapi.com/"
 ESPN_INJ = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
 
 HEADERS = {
@@ -35,16 +36,16 @@ HEADERS = {
 
 
 def get(path, params, tries=7):
-    # Resilient against intermittent ScrapeOps/NBA.com throttling: a shorter per-request timeout so a HUNG proxy
+    # Resilient against intermittent ScraperAPI/NBA.com throttling: a shorter per-request timeout so a HUNG proxy
     # instance fails fast (instead of burning 130s), but MORE retries with capped backoff so the crawl keeps
     # grabbing fresh proxy instances until one gets through — this is why daytime builds were hanging ~57 min.
     target = BASE + path + "?" + urlencode(params)
-    proxy_payload = {"api_key": SCRAPEOPS_KEY, "url": target, "residential": "true", "keep_headers": "true"}
+    proxy_payload = {"api_key": SA_KEY, "url": target, "premium": "true", "country_code": "us", "keep_headers": "true"}
     proxy_url = PROXY + "?" + urlencode(proxy_payload)
     last = None
     for i in range(tries):
         try:
-            r = requests.get(proxy_url, headers=HEADERS, timeout=55)
+            r = requests.get(proxy_url, headers=HEADERS, timeout=70)
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -147,14 +148,15 @@ def pbnorm(s):
 
 
 def get_url(full_url, tries=7, residential=True):
-    payload = {"api_key": SCRAPEOPS_KEY, "url": full_url}
+    payload = {"api_key": SA_KEY, "url": full_url}
     if residential:
-        payload["residential"] = "true"
+        payload["premium"] = "true"
+        payload["country_code"] = "us"
     proxy_url = PROXY + "?" + urlencode(payload)
     last = None
     for i in range(tries):
         try:
-            r = requests.get(proxy_url, timeout=55)
+            r = requests.get(proxy_url, timeout=70)
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -165,7 +167,7 @@ def get_url(full_url, tries=7, residential=True):
 
 
 def fetch_injuries_raw():
-    # ESPN site.api is public; try direct first (free), fall back to the ScrapeOps proxy.
+    # ESPN site.api is public; try direct first (free), fall back to the ScraperAPI proxy.
     try:
         r = requests.get(ESPN_INJ, headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"}, timeout=30)
         r.raise_for_status()
@@ -246,8 +248,8 @@ def num(v):
 
 
 def main():
-    if not SCRAPEOPS_KEY:
-        print("WARNING: SCRAPEOPS_API_KEY not set -- requests will likely fail (403).")
+    if not SA_KEY:
+        print("WARNING: SCRAPERAPI_KEY (or legacy SCRAPEOPS_API_KEY) not set -- requests will likely fail (403).")
 
     errors = {}
     game_date = os.environ.get("NBA_DATE", et_date())
