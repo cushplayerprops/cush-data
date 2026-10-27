@@ -12,6 +12,12 @@ import requests
 from urllib.parse import urlencode
 
 SEASON = os.environ.get("NBA_SEASON") or "2026-27"
+def _prev_season(_s):
+    try:
+        _y = int(str(_s)[:4]); return "%d-%02d" % (_y - 1, _y % 100)
+    except Exception:
+        return None
+PREV_SEASON = os.environ.get("NBA_PREV_SEASON") or _prev_season(SEASON)
 LEAGUE = "00"
 STYPE  = os.environ.get("NBA_SEASON_TYPE") or "Regular Season"  # "Pre Season" to test now, "Regular Season" live
 OUT    = os.environ.get("OUT", "nba_stats.json")
@@ -974,9 +980,9 @@ def main():
 
     SYN_TYPES = ["Transition", "Isolation", "PRBallHandler", "PRRollman", "Postup",
                  "Spotup", "Handoff", "Cut", "OffScreen", "OffRebound", "Misc"]
-    def syn_params(play_type, grouping, por):
+    def syn_params(play_type, grouping, por, season=None):
         return {"LeagueID": LEAGUE, "PerMode": "PerGame", "PlayType": play_type,
-                "PlayerOrTeam": por, "SeasonType": STYPE, "SeasonYear": SEASON,
+                "PlayerOrTeam": por, "SeasonType": STYPE, "SeasonYear": season or SEASON,
                 "TypeGrouping": grouping}
     def ingest_syn_off(pt, js):
         n = 0
@@ -1005,6 +1011,42 @@ def main():
         except Exception as _e:
             errors["synDef_" + _pt] = str(_e)
     adv_debug["synOffRows"] = _syn_n
+
+    # PRIOR-SEASON play-type BASELINE: NBA.com's synergy endpoint only lists a player once he has logged enough
+    # possessions in a play type, so early in the season most veterans have NO current-season profile. Pull last
+    # season as the baseline and use it for any player without a reliable current sample yet. Play style is very
+    # stable year to year, so this is what the public sites effectively show in October. Fail-safe: any error just
+    # leaves current-season behavior unchanged.
+    SYN_CUR_MIN_GP = int(os.environ.get("SYN_CUR_MIN_GP", "12"))
+    syn_prev = {}
+    def ingest_syn_prev(pt, js):
+        for r in rows(js):
+            pid = r.get("PLAYER_ID")
+            if pid is not None and pid in players:
+                v = num(r.get("PTS"))
+                if v is not None:
+                    syn_prev.setdefault(pid, {})[pt] = v
+    _prev_n = 0
+    if PREV_SEASON:
+        for _pt in SYN_TYPES:
+            try:
+                ingest_syn_prev(_pt, get("/synergyplaytypes", syn_params(_pt, "offensive", "P", PREV_SEASON)))
+            except Exception as _e:
+                errors["synPrev_" + _pt] = str(_e)
+        _prev_n = sum(len(x) for x in syn_prev.values())
+    _syn_fallback = 0
+    for _pid, _pp in players.items():
+        _cur = _pp.get("syn")
+        _prev = syn_prev.get(_pid)
+        _gp = _pp.get("gp") or 0
+        if _prev and ((not _cur) or _gp < SYN_CUR_MIN_GP):
+            _pp["syn"] = _prev
+            _pp["synSrc"] = "prev"
+            _syn_fallback += 1
+        elif _cur:
+            _pp["synSrc"] = "cur"
+    adv_debug["synPrevRows"] = _prev_n
+    adv_debug["synFallbackPlayers"] = _syn_fallback
 
     def ingest_track(js, mapping, dbg=None):
         c = 0
