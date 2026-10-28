@@ -697,6 +697,7 @@ def main():
             # raw per-game counting stats ALLOWED (for the matchup-favorability panel)
             t["oppPts"] = num(r.get("OPP_PTS"))
             t["oppReb"] = num(r.get("OPP_REB"))
+            t["oppOreb"] = num(r.get("OPP_OREB"))
             t["oppAst"] = num(r.get("OPP_AST"))
             t["oppFg3m"] = num(r.get("OPP_FG3M"))
             # opponent assist rate = share of allowed FGs that were assisted.
@@ -992,6 +993,13 @@ def main():
                 v = num(r.get("PTS"))
                 if v is not None:
                     players[pid].setdefault("syn", {})[pt] = v; n += 1
+                # play-type FREQUENCY (share of his possessions) = the weight the funnel scoring needs
+                fq = r.get("POSS_PCT")
+                if fq is None:
+                    fq = r.get("FREQ")
+                fq = num(fq)
+                if fq is not None:
+                    players[pid].setdefault("synFreq", {})[pt] = fq
         return n
     def ingest_syn_def(pt, js):
         for r in rows(js):
