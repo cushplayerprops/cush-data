@@ -1166,6 +1166,12 @@ def main():
                 players[pid][_pfx + "_fga"] = num(r.get("FGA"))
                 players[pid][_pfx + "_fgm"] = num(r.get("FGM"))
                 players[pid][_pfx + "_pct"] = num(r.get("FG_PCT"))
+                # 2pt/3pt split: FREQ% (share of ALL shots that are this range+2/3) and makes, so a
+                # 3PM/3PA prop uses the 3pt side of each shot-type funnel and a 2PM/2PA the 2pt side.
+                players[pid][_pfx + "_fg3freq"] = num(r.get("FG3A_FREQUENCY"))
+                players[pid][_pfx + "_fg2freq"] = num(r.get("FG2A_FREQUENCY"))
+                players[pid][_pfx + "_fg3m"] = num(r.get("FG3M"))
+                players[pid][_pfx + "_fg2m"] = num(r.get("FG2M"))
                 _c += 1
             adv_debug["pShot_" + _pfx] = _c
         except Exception as _e:
@@ -1197,6 +1203,12 @@ def main():
                 t[_pfx + "_fga"] = num(r.get("FGA"))
                 t[_pfx + "_fgm"] = num(r.get("FGM"))
                 t[_pfx + "_pct"] = num(r.get("FG_PCT"))
+                # 2pt/3pt split allowed: FREQ% (share of all shots the D gives up that are this
+                # range+2/3) and makes, so shot-type funnels can be prop-appropriate (3s vs 2s).
+                t[_pfx + "_fg3freq"] = num(r.get("FG3A_FREQUENCY"))
+                t[_pfx + "_fg2freq"] = num(r.get("FG2A_FREQUENCY"))
+                t[_pfx + "_fg3m"] = num(r.get("FG3M"))
+                t[_pfx + "_fg2m"] = num(r.get("FG2M"))
                 _c += 1
             adv_debug["oppShot_" + _pfx] = _c
         except Exception as _e:
