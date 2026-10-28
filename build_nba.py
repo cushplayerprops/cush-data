@@ -1034,16 +1034,12 @@ def main():
             except Exception as _e:
                 errors["synPrev_" + _pt] = str(_e)
         _prev_n = sum(len(x) for x in syn_prev.values())
+    # THIS-SEASON ONLY (Josh): never fall back to last season. No current sample for a play type =
+    # no profile for it (the play-style pillar reads neutral), instead of a stale/wrong-team one.
+    # Traded players read as their current team immediately.
     _syn_fallback = 0
     for _pid, _pp in players.items():
-        _cur = _pp.get("syn")
-        _prev = syn_prev.get(_pid)
-        _gp = _pp.get("gp") or 0
-        if _prev and ((not _cur) or _gp < SYN_CUR_MIN_GP):
-            _pp["syn"] = _prev
-            _pp["synSrc"] = "prev"
-            _syn_fallback += 1
-        elif _cur:
+        if _pp.get("syn"):
             _pp["synSrc"] = "cur"
     adv_debug["synPrevRows"] = _prev_n
     adv_debug["synFallbackPlayers"] = _syn_fallback
