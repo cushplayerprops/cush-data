@@ -44,7 +44,7 @@ def get(path, params, tries=7):
     # Resilient against intermittent ScrapeOps/NBA.com throttling: a shorter per-request timeout so a HUNG proxy
     # instance fails fast (instead of burning 130s), but MORE retries with capped backoff so the crawl keeps
     # grabbing fresh proxy instances until one gets through — this is why daytime builds were hanging ~57 min.
-    target = BASE + path + "?" + urlencode(params)
+    target = BASE + path + "?" + urlencode(params) + "&_=" + str(int(time.time() * 1000))
     proxy_payload = {"api_key": SCRAPEOPS_KEY, "url": target, "residential": "true", "keep_headers": "true"}
     proxy_url = PROXY + "?" + urlencode(proxy_payload)
     last = None
