@@ -1,0 +1,48 @@
+name: Build nba projections (shadow)
+
+# Runs right after "Build nba_stats" finishes (so nba_stats.json is fresh),
+# plus a manual trigger. Grades the PRIOR snapshot against the now-complete
+# games, then writes a NEW snapshot for the next slate. Append-only shadow log.
+on:
+  workflow_run:
+    workflows: ["Build nba_stats"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  project:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No third-party deps — pure stdlib.
+
+      - name: Grade prior snapshot against actuals
+        run: python grade_nba_proj.py || echo "grade step skipped/soft-failed"
+
+      - name: Build new projection snapshot
+        run: python build_nba_proj.py
+
+      - name: Commit projections
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add nba_proj_snapshot.json nba_proj_graded.jsonl
+          git diff --staged --quiet && { echo "no changes"; exit 0; }
+          git commit -m "update nba projections [skip ci]"
+          # resilient push: other feed workflows push to main constantly
+          for i in 1 2 3 4 5 6; do
+            git pull --rebase --autostash origin main \
+              && git push && { echo "pushed on attempt $i"; exit 0; }
+            echo "push attempt $i lost the race, retrying..."
+            sleep $(( (RANDOM % 6) + 3 ))
+          done
+          echo "push failed after 6 attempts" >&2
+          exit 1
