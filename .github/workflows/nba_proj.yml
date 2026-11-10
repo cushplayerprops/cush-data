@@ -34,7 +34,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add nba_proj_snapshot.json nba_proj_graded.jsonl
+          git add -A
           git diff --staged --quiet && { echo "no changes"; exit 0; }
           git commit -m "update nba projections [skip ci]"
           # resilient push: other feed workflows push to main constantly
