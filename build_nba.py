@@ -403,10 +403,13 @@ def main():
     _PZONE_KEYS = ("z_ra", "z_paint", "z_mid", "z_corner3", "z_above3",
                    "z_ra_pct", "z_paint_pct", "z_mid_pct", "z_corner3_pct", "z_above3_pct")
     _PZW = float(os.environ.get("NBA_PZONE_W", "0.0"))
-    if _PZW > 0:
-        try:
-            ingest_zones(get("/leaguedashplayershotlocations",
-                             dash({"DistanceRange": "By Zone", "LastNGames": "10"})), "_l10")
+    try:
+        # Always harvest Last-10 player shot zones so the Shooting Zones panel can show an
+        # L10 profile. These land as z_*_l10 keys and are KEPT in the feed. The season keys
+        # (z_ra etc.) stay pure season unless NBA_PZONE_W>0 asks for a blend.
+        ingest_zones(get("/leaguedashplayershotlocations",
+                         dash({"DistanceRange": "By Zone", "LastNGames": "10"})), "_l10")
+        if _PZW > 0:
             _PZFULL = float(os.environ.get("NBA_DVP_FULL", "6"))
             for _p in players.values():
                 _rg = _p.get("r_gp") or 0
@@ -416,10 +419,8 @@ def main():
                     _r = _p.get(_zk + "_l10")
                     if _s is not None and _r is not None and _w > 0:
                         _p[_zk] = round((1.0 - _w) * _s + _w * _r, 3)
-                    if (_zk + "_l10") in _p:
-                        del _p[_zk + "_l10"]     # drop temp key so it doesn't bloat the feed
-        except Exception as e:
-            errors["shotZonesL10"] = str(e)
+    except Exception as e:
+        errors["shotZonesL10"] = str(e)
 
     def ingest_scoring(js):
         for r in rows(js):
@@ -787,8 +788,7 @@ def main():
                 _r = _t.get(_zk + "_l10")
                 if _s is not None and _r is not None and _w > 0:
                     _t[_zk] = round((1.0 - _w) * _s + _w * _r, 3)
-                if (_zk + "_l10") in _t:
-                    del _t[_zk + "_l10"]     # drop the temp key so it doesn't bloat the feed
+                # keep dz_*_l10 keys in the feed so the Shooting Zones "OPP D" view can show L10
     except Exception as e:
         errors["teamZoneDefL10"] = str(e)
 
@@ -1148,11 +1148,11 @@ def main():
     # as the opponent-shots table below so the Shot Type panel's player bars and the
     # defensive ranks come from one consistent dataset. FGA/FGM/FG% per range.
     #   csShot_* = Catch and Shoot,  puShot_* = Pull-ups,  lt10Shot_* = <10 ft
-    def _pshot_params(general_range):
+    def _pshot_params(general_range, lastn="0"):
         p = ptparams("")
         p.pop("PtMeasureType", None)
         p.update({"GeneralRange": general_range, "DribbleRange": "", "CloseDefDistRange": "",
-                  "TouchTimeRange": "", "ShotDistRange": "", "ShotClockRange": ""})
+                  "TouchTimeRange": "", "ShotDistRange": "", "ShotClockRange": "", "LastNGames": lastn})
         return p
     for _gr, _pfx in (("Catch and Shoot", "csShot"),
                       ("Pullups", "puShot"),
@@ -1168,6 +1168,30 @@ def main():
                 players[pid][_pfx + "_pct"] = num(r.get("FG_PCT"))
                 # 2pt/3pt split: FREQ% (share of ALL shots that are this range+2/3) and makes, so a
                 # 3PM/3PA prop uses the 3pt side of each shot-type funnel and a 2PM/2PA the 2pt side.
+                players[pid][_pfx + "_fg3freq"] = num(r.get("FG3A_FREQUENCY"))
+                players[pid][_pfx + "_fg2freq"] = num(r.get("FG2A_FREQUENCY"))
+                players[pid][_pfx + "_fg3m"] = num(r.get("FG3M"))
+                players[pid][_pfx + "_fg2m"] = num(r.get("FG2M"))
+                _c += 1
+            adv_debug["pShot_" + _pfx] = _c
+        except Exception as _e:
+            errors["pShot_" + _pfx] = str(_e)
+
+    # LAST-10 player shot-type volume, kept as csShot_l10_*/puShot_l10_*/lt10Shot_l10_* so the
+    # Shot Type panel can show recent form next to the season profile. Additive: season keys above
+    # are untouched. Same endpoint/fields, LastNGames=10.
+    for _gr, _pfx in (("Catch and Shoot", "csShot_l10"),
+                      ("Pullups", "puShot_l10"),
+                      ("Less Than 10 ft", "lt10Shot_l10")):
+        try:
+            _c = 0
+            for r in rows(get("/leaguedashplayerptshot", _pshot_params(_gr, "10"))):
+                pid = r.get("PLAYER_ID")
+                if pid is None or pid not in players:
+                    continue
+                players[pid][_pfx + "_fga"] = num(r.get("FGA"))
+                players[pid][_pfx + "_fgm"] = num(r.get("FGM"))
+                players[pid][_pfx + "_pct"] = num(r.get("FG_PCT"))
                 players[pid][_pfx + "_fg3freq"] = num(r.get("FG3A_FREQUENCY"))
                 players[pid][_pfx + "_fg2freq"] = num(r.get("FG2A_FREQUENCY"))
                 players[pid][_pfx + "_fg3m"] = num(r.get("FG3M"))
