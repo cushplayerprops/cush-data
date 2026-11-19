@@ -1208,11 +1208,11 @@ def main():
     #   C&S rank  -> oppCS_fga   (attempts allowed)
     #   Pull-up   -> oppPU_fga / oppPU_fgm
     #   <10 ft    -> oppLt10_fgm (makes allowed)  + oppLt10_fga / _pct
-    def _oppshot_params(general_range):
+    def _oppshot_params(general_range, lastn="0"):
         p = dash({})
         p.pop("MeasureType", None)            # leaguedashoppptshot has no MeasureType
         p.update({"GeneralRange": general_range, "DribbleRange": "",
-                  "CloseDefDistRange": "", "TouchTimeRange": "", "ShotDistRange": ""})
+                  "CloseDefDistRange": "", "TouchTimeRange": "", "ShotDistRange": "", "LastNGames": lastn})
         return p
     for _gr, _pfx in (("Catch and Shoot", "oppCS"),
                       ("Pullups", "oppPU"),
@@ -1229,6 +1229,31 @@ def main():
                 t[_pfx + "_pct"] = num(r.get("FG_PCT"))
                 # 2pt/3pt split allowed: FREQ% (share of all shots the D gives up that are this
                 # range+2/3) and makes, so shot-type funnels can be prop-appropriate (3s vs 2s).
+                t[_pfx + "_fg3freq"] = num(r.get("FG3A_FREQUENCY"))
+                t[_pfx + "_fg2freq"] = num(r.get("FG2A_FREQUENCY"))
+                t[_pfx + "_fg3m"] = num(r.get("FG3M"))
+                t[_pfx + "_fg2m"] = num(r.get("FG2M"))
+                _c += 1
+            adv_debug["oppShot_" + _pfx] = _c
+        except Exception as _e:
+            errors["oppShot_" + _pfx] = str(_e)
+
+    # LAST-10 opponent shot-type ALLOWED (oppCS_l10_*/oppPU_l10_*/oppLt10_l10_*) so the Shot Type
+    # panel can grade the matchup on the defense's RECENT form while the player's shot diet stays
+    # season. Additive: season oppCS_*/oppPU_*/oppLt10_* above are untouched. Same fields, LastNGames=10.
+    for _gr, _pfx in (("Catch and Shoot", "oppCS_l10"),
+                      ("Pullups", "oppPU_l10"),
+                      ("Less Than 10 ft", "oppLt10_l10")):
+        try:
+            _c = 0
+            for r in rows(get("/leaguedashoppptshot", _oppshot_params(_gr, "10"))):
+                tid = r.get("TEAM_ID")
+                t = teams.get(tid) if tid is not None else None
+                if t is None:
+                    continue
+                t[_pfx + "_fga"] = num(r.get("FGA"))
+                t[_pfx + "_fgm"] = num(r.get("FGM"))
+                t[_pfx + "_pct"] = num(r.get("FG_PCT"))
                 t[_pfx + "_fg3freq"] = num(r.get("FG3A_FREQUENCY"))
                 t[_pfx + "_fg2freq"] = num(r.get("FG2A_FREQUENCY"))
                 t[_pfx + "_fg3m"] = num(r.get("FG3M"))
