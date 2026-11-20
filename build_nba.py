@@ -587,6 +587,7 @@ def main():
             stl = num(r.get("STL")); blk = num(r.get("BLK")); tov = num(r.get("TOV"))
             tmp.setdefault(pid, []).append({
                 "d": r.get("GAME_DATE"),
+                "gid": r.get("GAME_ID"),
                 "min": mn,
                 "fga": fga,
                 "fg3a": fg3a,
@@ -672,6 +673,70 @@ def main():
             errors["gameLogs"] = "no log chunks returned"
     except Exception as e:
         errors["gameLogs"] = str(e)
+
+    # ---- Per-game REBOUND CHANCES for tonight's slate (boxscoreplayertrackv2) ----
+    # The playergamelogs rows carry no rebound-chance tracking, so the Last-10 rebounds
+    # chart can only show a season/recent average. Here we pull per-game chances for the
+    # teams playing on the slate (so each game-log bar can show that game's actual chances).
+    # Scoped to slate-team players' recent games + de-duped by GAME_ID to keep the call
+    # count bounded; a non-slate player who shared one of those games gets filled too.
+    try:
+        _slate_team_ids = set()
+        for g in games:
+            for side in ("home", "away"):
+                _tid = (g.get(side) or {}).get("id")
+                if _tid is not None:
+                    _slate_team_ids.add(_tid)
+        _RC_RECENT = int(os.environ.get("NBA_REBCH_GAMES", "10"))
+        _RC_CAP = int(os.environ.get("NBA_REBCH_CAP", "220"))
+        _rc_gids = []
+        _rc_seen = set()
+        for pid, p in players.items():
+            if p.get("teamId") not in _slate_team_ids:
+                continue
+            for lg in (p.get("log") or [])[:_RC_RECENT]:
+                gid = lg.get("gid")
+                if gid and gid not in _rc_seen:
+                    _rc_seen.add(gid)
+                    _rc_gids.append(gid)
+        _rc_gids = _rc_gids[:_RC_CAP]
+        # gid -> { pid -> {rebCh,orebCh,drebCh} }
+        _rc_by_game = {}
+        for gid in _rc_gids:
+            try:
+                _bx = get("/boxscoreplayertrackv2", {"GameID": gid})
+                _m = {}
+                for pr in rows(_bx, "PlayerStats"):
+                    _pid = pr.get("PLAYER_ID")
+                    if _pid is None:
+                        continue
+                    _m[_pid] = {
+                        "rebCh": num(pr.get("RBC")),
+                        "orebCh": num(pr.get("ORBC")),
+                        "drebCh": num(pr.get("DRBC")),
+                    }
+                if _m:
+                    _rc_by_game[gid] = _m
+            except Exception as _rce:
+                errors.setdefault("rebChGame", str(_rce))
+        _rc_merged = 0
+        for pid, p in players.items():
+            for lg in (p.get("log") or []):
+                gid = lg.get("gid")
+                if not gid:
+                    continue
+                gm = _rc_by_game.get(gid)
+                if not gm:
+                    continue
+                rc = gm.get(pid)
+                if rc and rc.get("rebCh") is not None:
+                    lg["rebCh"] = rc["rebCh"]
+                    lg["orebCh"] = rc["orebCh"]
+                    lg["drebCh"] = rc["drebCh"]
+                    _rc_merged += 1
+        errors.setdefault("_rebChInfo", "games=%d merged=%d" % (len(_rc_by_game), _rc_merged))
+    except Exception as _rce0:
+        errors.setdefault("rebCh", str(_rce0))
 
     id2abbr = {}
     for p in players.values():
