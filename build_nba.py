@@ -40,23 +40,23 @@ HEADERS = {
 }
 
 
-def get(path, params, tries=7):
-    # Resilient against intermittent ScrapeOps/NBA.com throttling: a shorter per-request timeout so a HUNG proxy
-    # instance fails fast (instead of burning 130s), but MORE retries with capped backoff so the crawl keeps
-    # grabbing fresh proxy instances until one gets through — this is why daytime builds were hanging ~57 min.
+def get(path, params, tries=4):
+    # Fail-fast against intermittent ScrapeOps/NBA.com throttling: short per-request timeout (35s) + few retries
+    # (4) with tight backoff, so a flaky endpoint caps at ~2.5 min instead of ~6.5 min. The workflow also has a
+    # 45-min job timeout, so a wedged runner self-kills instead of riding GitHub's 6h cap and burning credits.
     target = BASE + path + "?" + urlencode(params) + "&_=" + str(int(time.time() * 1000))
     proxy_payload = {"api_key": SCRAPEOPS_KEY, "url": target, "residential": "true", "keep_headers": "true"}
     proxy_url = PROXY + "?" + urlencode(proxy_payload)
     last = None
     for i in range(tries):
         try:
-            r = requests.get(proxy_url, headers=HEADERS, timeout=55)
+            r = requests.get(proxy_url, headers=HEADERS, timeout=35)
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last = e
             print(f"  retry {i+1}/{tries} for {path}: {e}")
-            time.sleep(min(2 + i * 2, 12))
+            time.sleep(min(2 + i * 2, 8))
     raise last
 
 
@@ -152,7 +152,7 @@ def pbnorm(s):
     return s
 
 
-def get_url(full_url, tries=7, residential=True):
+def get_url(full_url, tries=4, residential=True):
     payload = {"api_key": SCRAPEOPS_KEY, "url": full_url}
     if residential:
         payload["residential"] = "true"
@@ -160,7 +160,7 @@ def get_url(full_url, tries=7, residential=True):
     last = None
     for i in range(tries):
         try:
-            r = requests.get(proxy_url, timeout=55)
+            r = requests.get(proxy_url, timeout=35)
             r.raise_for_status()
             return r.json()
         except Exception as e:
