@@ -702,7 +702,11 @@ def main():
         _rc_gids = _rc_gids[:_RC_CAP]
         # gid -> { pid -> {rebCh,orebCh,drebCh} }
         _rc_by_game = {}
+        _rc_deadline = time.time() + int(os.environ.get("NBA_REBCH_BUDGET", "1400"))
         for gid in _rc_gids:
+            if time.time() > _rc_deadline:
+                errors.setdefault("rebChBudget", "stopped at %d/%d games (recent-first)" % (len(_rc_by_game), len(_rc_gids)))
+                break
             try:
                 _bx = get("/boxscoreplayertrackv2", {"GameID": gid})
                 _m = {}
