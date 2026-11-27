@@ -751,6 +751,68 @@ def main():
     except Exception as _rce0:
         errors.setdefault("rebCh", str(_rce0))
 
+    # ---- Per-game POTENTIAL ASSISTS via date-scoped leaguedashptstats (Passing) ----
+    # boxscoreplayertrackv3 carries rebound chances but NOT potential assists. The passing
+    # tracking dashboard does (POTENTIAL_AST). Scoped to a single date (DateFrom=DateTo) it
+    # returns every player's single-game potential assists for that slate in ONE call, matched
+    # to each log entry by player id + date. Missing (no tracking that game) stays BLANK (None),
+    # never 0. One call per date -> far cheaper than per-game box scores.
+    try:
+        def _logdate_iso(_d):
+            s = str(_d or "")[:10]
+            return s if (len(s) == 10 and s[4] == "-" and s[7] == "-") else None
+        def _iso_to_mdy(_iso):
+            y, m, dd = _iso.split("-")
+            return "%s/%s/%s" % (m, dd, y)
+        _pa_dates = {}
+        for pid, p in players.items():
+            if p.get("teamId") not in _slate_team_ids:
+                continue
+            for lg in (p.get("log") or [])[:_RC_RECENT]:
+                _iso = _logdate_iso(lg.get("d"))
+                if _iso:
+                    _pa_dates[_iso] = True
+        _pa_by_date = {}  # iso -> {pid: potAst}
+        _pa_deadline = time.time() + int(os.environ.get("NBA_POTAST_BUDGET", "900"))
+        for _iso in sorted(_pa_dates):
+            if time.time() > _pa_deadline:
+                errors.setdefault("potAstBudget", "stopped at %d/%d dates" % (len(_pa_by_date), len(_pa_dates)))
+                break
+            try:
+                _pp = ptparams("Passing")
+                _pp["PerMode"] = "Totals"
+                _mdy = _iso_to_mdy(_iso)
+                _pp["DateFrom"] = _mdy
+                _pp["DateTo"] = _mdy
+                _pj = get("/leaguedashptstats", _pp)
+                _m = {}
+                for r in rows(_pj):
+                    _pid = r.get("PLAYER_ID")
+                    if _pid is None:
+                        continue
+                    _m[_pid] = num(r.get("POTENTIAL_AST"))
+                if _m:
+                    _pa_by_date[_iso] = _m
+            except Exception as _pae:
+                errors.setdefault("potAstDate", str(_pae))
+            time.sleep(0.8)
+        _pa_merged = 0
+        for pid, p in players.items():
+            for lg in (p.get("log") or []):
+                _iso = _logdate_iso(lg.get("d"))
+                if not _iso:
+                    continue
+                _dm = _pa_by_date.get(_iso)
+                if not _dm:
+                    continue
+                _v = _dm.get(pid)
+                if _v is not None:
+                    lg["potAst"] = _v
+                    _pa_merged += 1
+        errors.setdefault("_potAstInfo", "dates=%d merged=%d" % (len(_pa_by_date), _pa_merged))
+    except Exception as _pae0:
+        errors.setdefault("potAst", str(_pae0))
+
     id2abbr = {}
     for p in players.values():
         if p.get("teamId") is not None and p.get("teamAbbr"):
