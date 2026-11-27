@@ -674,9 +674,10 @@ def main():
     except Exception as e:
         errors["gameLogs"] = str(e)
 
-    # ---- Per-game REBOUND CHANCES for tonight's slate (boxscoreplayertrackv2) ----
-    # The playergamelogs rows carry no rebound-chance tracking, so the Last-10 rebounds
-    # chart can only show a season/recent average. Here we pull per-game chances for the
+    # ---- Per-game REBOUND CHANCES + POTENTIAL ASSISTS for tonight's slate (boxscoreplayertrackv3) ----
+    # The playergamelogs rows carry no rebound-chance or potential-assist tracking, so the Last-10
+    # rebounds/assists charts can only show a season/recent average. Here we pull per-game chances AND
+    # potential assists (v3 returns both in one call) for the
     # teams playing on the slate (so each game-log bar can show that game's actual chances).
     # Scoped to slate-team players' recent games + de-duped by GAME_ID to keep the call
     # count bounded; a non-slate player who shared one of those games gets filled too.
@@ -700,7 +701,7 @@ def main():
                     _rc_seen.add(gid)
                     _rc_gids.append(gid)
         _rc_gids = _rc_gids[:_RC_CAP]
-        # gid -> { pid -> {rebCh,orebCh,drebCh} }
+        # gid -> { pid -> {rebCh,orebCh,drebCh,potAst} }
         _rc_by_game = {}
         _rc_deadline = time.time() + int(os.environ.get("NBA_REBCH_BUDGET", "1400"))
         for gid in _rc_gids:
@@ -708,17 +709,21 @@ def main():
                 errors.setdefault("rebChBudget", "stopped at %d/%d games (recent-first)" % (len(_rc_by_game), len(_rc_gids)))
                 break
             try:
-                _bx = get("/boxscoreplayertrackv2", {"GameID": gid})
+                _bx = get("/boxscoreplayertrackv3", {"GameID": gid})
                 _m = {}
-                for pr in rows(_bx, "PlayerStats"):
-                    _pid = pr.get("PLAYER_ID")
-                    if _pid is None:
-                        continue
-                    _m[_pid] = {
-                        "rebCh": num(pr.get("RBC")),
-                        "orebCh": num(pr.get("ORBC")),
-                        "drebCh": num(pr.get("DRBC")),
-                    }
+                _bs = (_bx or {}).get("boxScorePlayerTrack") or {}
+                for _side in ("homeTeam", "awayTeam"):
+                    for _pl in ((_bs.get(_side) or {}).get("players") or []):
+                        _pid = _pl.get("personId")
+                        if _pid is None:
+                            continue
+                        _st = _pl.get("statistics") or {}
+                        _m[_pid] = {
+                            "rebCh": num(_st.get("reboundChancesTotal")),
+                            "orebCh": num(_st.get("reboundChancesOffensive")),
+                            "drebCh": num(_st.get("reboundChancesDefensive")),
+                            "potAst": num(_st.get("potentialAssists")),
+                        }
                 if _m:
                     _rc_by_game[gid] = _m
             except Exception as _rce:
@@ -733,11 +738,15 @@ def main():
                 if not gm:
                     continue
                 rc = gm.get(pid)
-                if rc and rc.get("rebCh") is not None:
-                    lg["rebCh"] = rc["rebCh"]
-                    lg["orebCh"] = rc["orebCh"]
-                    lg["drebCh"] = rc["drebCh"]
-                    _rc_merged += 1
+                if rc:
+                    if rc.get("rebCh") is not None:
+                        lg["rebCh"] = rc["rebCh"]
+                        lg["orebCh"] = rc["orebCh"]
+                        lg["drebCh"] = rc["drebCh"]
+                    if rc.get("potAst") is not None:
+                        lg["potAst"] = rc["potAst"]
+                    if rc.get("rebCh") is not None or rc.get("potAst") is not None:
+                        _rc_merged += 1
         errors.setdefault("_rebChInfo", "games=%d merged=%d" % (len(_rc_by_game), _rc_merged))
     except Exception as _rce0:
         errors.setdefault("rebCh", str(_rce0))
